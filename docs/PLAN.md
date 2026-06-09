@@ -1,109 +1,150 @@
 # Plan — Sentinel-1 Amplitude Explorer
 
-Decisions (locked with Stephen 2026-06-09): **Path A** (Earth Search
-`sentinel-1-grd` COGs) first, EOPF GeoZarr as a later track. **Grayscale**
-default look, with a **dramatic dark/high-contrast preset** held in reserve.
-Product **IW GRD**, **VV** default / **VH** toggle, **dB** display, **no
-elevation**. Background and trade-offs in `docs/RESEARCH.md`.
+> **NEXT AGENT: START HERE.** This is the committed direction as of 2026-06-09.
+> **Start by cutting a new branch off `main`** (e.g. `gcp-warp`) — this work lands
+> there, not on `main`. Read this whole file, then `docs/RESEARCH.md` and
+> `.claude/memory/MEMORY.md`.
+> The headline: we are building a **client-side GCP warp of raw Sentinel-1 GRD
+> amplitude**, read straight from open object storage. No backend, no DEM, no
+> tile server. This is the no-compromise path Stephen held out for after we
+> burned through every off-the-shelf source.
 
-## Phase 0 — Source verified (DONE)
+## The decision (why this and not a quick swap)
 
-Live probe of Earth Search `sentinel-1-grd` (Andes scene
-`S1A_IW_GRDH_1SDV_20240228T232840...`):
+Stephen's non-negotiables: **raw amplitude, from open object storage / a tolerant
+API, rendered client-side and ultralight, with the dramatic GRD relief look,
+global.** Every shortcut violated one of these. The dead ends, so the next agent
+doesn't re-walk them:
 
-| property | value | implication |
-|---|---|---|
-| asset hrefs | `s3://sentinel-s1-l1c/.../measurement/iw-vv.tiff` | must rewrite `s3://` → `https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/<key>` |
-| CORS | `Access-Control-Allow-Origin: *`, `GET` | browser range reads allowed |
-| range read | anonymous `206 Partial Content`, `Accept-Ranges: bytes` | no auth, **not** requester-pays (no `x-amz-request-charged`) |
-| `proj:epsg` | **4326** (geographic) | global reproject 4326→3857, NOT per-scene UTM |
-| assets | `vv`, `vh` (COG), plus schema/manifest XML | render `vv`/`vh` only |
-| `raster:bands` | `data_type: uint16`, `nodata: 0` | single-band amplitude; discard 0 as nodata |
-| file size | ~676 MB per VV COG | overview-driven; cost is visible-scene count |
-| `sar:instrument_mode` | `IW`, `sar:polarizations` `[VV, VH]` | filter to IW |
+| Source | Renders? | Open/CORS, no token? | Global? | Verdict |
+|---|---|---|---|---|
+| Earth Search `sentinel-1-grd` COG (`sentinel-s1-l1c`) | ✗ **GCP ground-range, no affine** | ✓ (`ACAO:*`, 206) | ✓ | data perfect, geometry unrenderable by default |
+| EOPF S1 GRD Zarr (`objects.eodc.eu`) | ✗ GCP ground-range | likely (unconfirmed CORS) | sample-only now | same geometry; GCP grid is a native array |
+| MPC `sentinel-1-rtc` | ✓ (UTM affine) | ✗ SAS token **+ throttles hard (504s)** | ✓ | we wired it, it throttled exactly as Stephen warned |
+| DE Africa `s1_rtc` (`deafrica-sentinel-1`) | ✓ (4326 affine) | ✗ **bucket has no CORS** (STAC does) | Africa only | perfect data, browser-blocked |
+| ASF OPERA RTC | ✓ | ✗ Earthdata auth | ✓ | needs a backend/proxy |
 
-No blockers. Path A is viable as a direct fork.
+The pattern: **renderable S1 (RTC) is always gated; open S1 (raw GRD) is always
+GCP ground-range.** deck.gl-geotiff only handles affine grids today; GCP support
+is a written-down *future* note (`packages/deck.gl-raster/.../tileset-interface.ts`:
+"allows non-affine transforms (e.g. GCPs) in the future"). No browser library
+anywhere does GCP warping — confirmed via GitHub search. Everyone terrain-corrects
+server-side first.
 
-## Phase 1 — STAC client swap (`web/src/stac.ts`)
+So we build the missing client-side piece. It is bounded and lightweight because
+the heavy part (DEM terrain correction) is the part we **skip** — exactly like the
+canonical EOPF notebook, which states its geocoding "does not involve terrain
+correction." Skipping it keeps the layover/foreshortening, i.e. the dramatic look.
 
-Replace the Earth Genome S2 client with a `sentinel-1-grd` client, using
-`earthSearchStac.ts.ref` as the POST-query template.
+## The architecture (client-side, ultralight)
 
-- Endpoint `https://earth-search.aws.element84.com/v1/search`, collection
-  `sentinel-1-grd`. POST bbox + datetime, `limit: 100`, paginate `rel=next`.
-- Filter `properties.sar:instrument_mode == "IW"`.
-- Project each feature to `{ id, bbox, assets: { vv, vh } }`.
-- **s3→https rewrite** helper: `s3://sentinel-s1-l1c/KEY` →
-  `https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/KEY`.
-- Drop the `CORS_OK_HOSTS` S2 logic (single known-open host now) but keep a
-  host guard.
-- Carry orbit direction / relative orbit in props if cheap (useful later for
-  consistent look-direction shading).
+The EOPF S1 GRD notebook recipe, ported to the browser:
 
-## Phase 2 — Render pipeline (the core work)
+```
+notebook                          browser (this app)
+--------                          ------------------
+open store / measurements/grd  →  STAC query → amplitude COG over HTTP range
+conditions/gcp (coarse grid)   →  read 210-pt GCP grid (21×10) from COG header
+gcp.interp_like(grd)           →  bilinear interpolator: pixel → (lon,lat)  [a FUNCTION, not an array]
+plot x=lon y=lat               →  RasterReprojector builds adaptive TIN mesh from that function
+10*log10                       →  GPU dB shader drapes amplitude on the mesh
+```
 
-Single-band amplitude, so this is *simpler* than S2 multiband, but needs two new
-pieces: a dB shader and a 4326→3857 reproject.
+Verified facts that make this concrete (probed 2026-06-09):
+- Raw VV COG `sentinel-s1-l1c/.../iw-vv.tiff`: 26117×16885 px, **uint16 amplitude**,
+  nodata 0, **overviews present**, bucket **CORS-open** (`ACAO:*`, anonymous 206,
+  not requester-pays).
+- It carries a **210-point GCP grid (21 distinct columns × 10 rows)**, each
+  `pixel,line → lon,lat` in WGS84. That is the entire geolocation payload: ~210
+  floats per scene. Tiny.
+- `@developmentseed/raster-reproject` (already a dep of deck.gl-raster) is a
+  standalone mesh reprojector taking arbitrary `ReprojectionFns` and refining a
+  delatin TIN — it does NOT need per-pixel lat/lon, only the function. This is why
+  it stays light.
 
-- **New shader `web/src/shaders/decibel.ts`** — `AmplitudeToDb`: from uint16 DN
-  `x` (sampler returns `x/65535`), compute intensity and `10*log10`. For a
-  visual look, `dB = 20*log10(DN)` (amplitude→intensity is the square) is fine;
-  precise sigma0 calibration via the calibration LUT is out of scope for v1
-  (note it as a future radiometric-accuracy task).
-- **Pipeline** (replaces NDVI chain in `renderPipeline.ts`):
-  `discardNodata(0)` → `AmplitudeToDb` → `LinearRescale(dbMin, dbMax)` →
-  grayscale (identity colormap) or `Colormap`. Default stretch ~ `[-25, 0]` dB
-  for VV land; expose via the existing dual-thumb slider.
-- **Reprojection 4326→3857.** Wire `@developmentseed/proj` so COGLayer/MosaicLayer
-  reproject geographic tiles to web mercator. Single global transform (not the
-  per-scene UTM the S2 app avoided). Confirm whether deck.gl-geotiff handles 4326
-  COGs natively at this version before adding the proj dep path.
-- Reuse `MosaicLayer` → one `COGLayer` per scene on the selected-pol asset
-  (single-band, so no MultiCOGLayer composite needed for grayscale).
+Why it's lightweight: we never materialize per-pixel lat/lon. The mesh refines
+only where the warp bends (a smooth ~21×10 grid → a coarse mesh). Amplitude tiles
+stream from overviews as usual. One extra small read per scene for the GCPs.
 
-## Phase 3 — UI rework (`web/src/App.tsx`)
+## Net-new work (sequenced; de-risk cheap first)
 
-- **Strip** the S2 index machinery: remove `INDICES`/NDVI/NDWI modes, the
-  spectral panel, multi-band composite wiring, `shaders/ndvi.ts`,
-  `discardBlack`'s S2-specific paths.
-- **Modes** become: polarization `VV` / `VH` (and later `VV/VH ratio`).
-- **Keep**: map shell, PlaceSearch, draw-AOI, load scoreboard, the **dual-thumb
-  slider** (now drives dB min/max), prefs/localStorage, keyboard shortcuts.
-- **Look controls**: grayscale default; a **"dramatic" contrast preset**
-  (gamma + tighter stretch toward inky shadows / bright foreslopes); keep the
-  inherited colormaps available but off by default.
-- Retitle panel/app to Sentinel-1 amplitude; update copy.
+**A. Read all GCPs from the GeoTIFF.** `@developmentseed/geotiff` fetches the
+ModelTiePoint tag but `transform.ts` uses only the first point (`[3],[4]`). The
+other 209 tiepoints are in the same tag (6 doubles each: i,j,k,x,y,z), plus the
+GDAL `_GDAL_GCPs`/GCP tag in some files. Parse them into a list of
+`{pixel,line,lon,lat}`. *Do this against the verified VV COG and check the count
+is 210 and GCP[0] ≈ (pixel0,line0)→(-72.3686,-33.7071), matching gdalinfo.*
 
-## Phase 4 — STAC explorer (Stephen flagged this needs work)
+**B. GCP→lon/lat interpolator.** ~30 lines. The tiepoints form a regular 21×10
+grid in pixel space; bilinear within each grid cell. Expose
+`forward(px,py) → [lon,lat]` and an approximate `inverse([lon,lat]) → [px,py]`
+(invert per-cell, or Newton from the forward). **Validate B standalone** (no
+deck.gl) by sampling a few pixels and comparing to gdalinfo GCP values. Ship A+B
+behind a tiny test before touching the tileset.
 
-Because S1 loads are deliberate (no dense load-anywhere, and the EOPF track is
-sample-only), the discovery UI carries weight:
+**C. Non-affine `RasterTileset` descriptor.** Implement `tileset-interface.ts`
+(`projectTo3857`, `projectTo4326`, `inverse4326ToSource`, per-tile
+`tileTransform → {forwardTransform, inverseTransform}`) from B. Source CRS is
+EPSG:4326 (GCP lon/lat); `projectTo3857` is the standard 4326→3857. Feed the
+existing `raster-tile-layer` + `raster-reproject` mesh path. This is the piece
+deck.gl-raster flagged as "future" — net-new, but it slots into an interface that
+already exists and is consumed by the affine tileset alongside it (copy
+`affine-tileset.ts` as the structural template).
 
-- Date-range + AOI search returning scene candidates with footprints, acquisition
-  date, orbit direction, polarizations available.
-- Step-by-date / browse-overpasses preview (adapt `groupByDate` /
-  coverage-selection ideas from `earthSearchStac.ts.ref`).
-- Show look-direction / orbit so the user can pick consistent relief shading.
-- Manual fetch (no auto-load on pan), matching the sibling apps' deliberate model.
+**D. Wire a layer + the dB pipeline.** A COG layer (or a thin custom layer) that
+builds the GCP tileset from A+B and renders amplitude through the dB shader we
+already have. The shader pipeline rides on top unchanged.
 
-## Phase 5 — Polish + deploy
+## What already exists (reuse, don't rebuild)
 
-- Tune the dramatic preset on real mountain (Andes/Himalaya/Alaska Range) and
-  desert (Namib/Atacama/Sahara) scenes.
-- README hero from a rendered frame.
-- GitHub Pages deploy already wired (`base: /s1-amplitude-explorer/`).
+- **dB shader** (`web/src/shaders/amplitude.ts`) + **gamma** (`shaders/gamma.ts`)
+  + the monochrome pipeline (`renderPipeline.ts`). *Note:* these are currently
+  tuned for **RTC float32 power** (`10*log10(power)`, discard ≤0) from the MPC
+  detour. For **raw GRD uint16 amplitude**, switch back to `20*log10(DN/65535)`
+  and nodata 0 (the earlier form, in git history).
+- **App shell** (`web/src/App.tsx`): map, PlaceSearch, draw-AOI, FETCH VIEW, load
+  scoreboard, **dual-thumb dB slider**, gamma, dramatic preset, VV/VH toggle,
+  prefs. All reusable.
+- **STAC client** (`web/src/stac.ts`): currently points at **MPC RTC** (with SAS
+  token + retry/backoff) from the detour. Repoint to Earth Search
+  `sentinel-1-grd` (raw COG, `s3://sentinel-s1-l1c` → https rewrite) — that code
+  existed one commit ago; see git history. Keep the IW filter and VV/VH shape.
+- **Screenshot harness** `web/shot.mjs` (Brave headless) for verifying renders.
 
-## Track 2 (later) — EOPF GeoZarr via deck.gl-raster `ZarrLayer`
+## Current working-tree state (important)
 
-Once Path A is solid: add an EOPF GeoZarr source as a second mode. No SAR
-amplitude `ZarrLayer` example exists upstream yet, so budget for spiking the
-GeoZarr S1 structure (consult EOPF Webinar 8 + deck.gl-raster GeoZarr docs).
-Sample-only coverage means the Phase 4 explorer must surface what EOPF actually
-has. This is where the ESA/DevSeed Zarr alignment with your event contacts pays
-off.
+The tree is mid-detour: `stac.ts` + the shader + prefs + App defaults were wired
+to **MPC RTC** to prove the render path end-to-end (it DID render the UI and
+stream tiles; MPC just throttled the tile reads with 504s, blanking the map).
+That detour confirmed the dB pipeline + reprojection + UI all work against an
+affine source. The GCP build (A–D) replaces the *source + geometry*, not the
+shader/UI. Decide whether to keep the MPC path behind a fallback toggle or strip
+it; Stephen leans toward the real thing.
 
-## Suggested first PR
+## Data source
 
-Phases 1+2 minimal: swap STAC to `sentinel-1-grd`, s3→https rewrite, single VV
-COGLayer, dB shader + grayscale stretch, 4326 reproject. Get one dramatic Andes
-scene on screen. Everything else (VH toggle, explorer, presets) layers on after.
+- **Primary:** raw GRD COGs, Earth Search `sentinel-1-grd` → `sentinel-s1-l1c`
+  bucket (CORS-verified). uint16 amplitude, 210-pt GCP grid, overviews.
+- **Alternate (equally valid):** EOPF S1 GRD Zarr on `objects.eodc.eu` — GCP grid
+  is a native `conditions/gcp` array (cleaner to read than COG tags). **Confirm
+  CORS on `objects.eodc.eu` before relying on it.** Read via `@developmentseed/
+  deck.gl-zarr` + `zarrita`.
+
+## Risks / unknowns
+
+- **Inverse transform.** `tileTransform` wants forward AND inverse. Forward
+  (pixel→lonlat) is easy; inverse (lonlat→pixel) needs per-cell inversion or a
+  Newton step. The mesh path may only need forward + a bounds query — check what
+  `affine-tileset.ts` actually calls before over-building the inverse.
+- **Antimeridian / pole-crossing scenes** — ignore for v1 (mid-latitude demo
+  AOIs: Andes, Himalaya, Namib, Atacama).
+- **No terrain correction** → horizontal misregistration in extreme relief
+  (layover). Acceptable / desirable for the look; note it in the UI.
+- **GCP tag variants.** Some COGs store GCPs as many ModelTiepoints, some as a
+  dedicated GDAL tag. Handle the ModelTiepoint-list case first (the verified file).
+
+## First milestone
+
+A+B shipped and validated against gdalinfo numbers (no deck.gl), then C+D rendering
+**one** raw GRD scene over the Andes, warped, in monochrome dB. Prove the warp
+visually against a known coastline/relief before scaling to a mosaic.
