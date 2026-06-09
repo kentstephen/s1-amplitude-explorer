@@ -9,57 +9,54 @@
 
 ---
 
-## ⛳ STATUS — session 2 (2026-06-09 PM). READ THIS FIRST.
+## ⛳ STATUS — session 3 (2026-06-09 PM). READ THIS FIRST.
 
-**THE DELIVERABLE IS A RUNNABLE BROWSER APP STEPHEN OPENS HIMSELF.** Not
-screenshots, not offline renders, not `/tmp` scripts. The single success
-criterion: `cd web && npm run dev`, open the URL, see the warped S1 amplitude
-image, pan/zoom it. **Do NOT generate images for him with GDAL/Python/etc.** A
-prior turn did an offline GDAL render to sanity-check the look (it worked: dark
-specular ocean, bright textured Andes relief, coastline correct) — that was a
-detour Stephen explicitly rejected. The look is proven; stop proving it. Build
-the tool.
+**C + D ARE DONE AND COMMITTED. Raw GRD renders in the browser through the GPU
+mesh.** Path C (the non-affine GCP tileset the lib flagged as "future") was built
+and slotted into the existing deck.gl-raster pipeline — NOT the client-side
+canvas/BitmapLayer fallback. That fallback was explicitly rejected by Stephen
+("you wanna go CPU side? kill my computer?"). Everything stays on the GPU.
 
-**Branch:** `gcp-warp` (cut off `main`; rename of the briefly-named
-`gcp-warp-zarr`). Work lands here, not `main`.
+**Branch:** `gcp-warp`. Commits: `d9d653c` (A+B) then `bf68ce1` (C+D + perf +
+manual fetch). Plus the fetchGen remount fix on top (commit after this doc edit).
 
-**Done this session (work items A + B — in the working tree, NOT yet committed;
-a commit was attempted and interrupted, so `git add`+commit them first):**
-- `web/src/gcp.ts` — `parseGcps(modelTiepoint)` reads ALL 210 GCPs from the flat
-  ModelTiepoint array; `buildGcpGrid` makes the 21×10 rectilinear lattice;
-  `forward(grid,px,py)→[lon,lat]` (bilinear, exact at nodes) and
-  `inverse(grid,lon,lat)→[px,py]` (per-cell Newton). Pure, no deck.gl dep.
-- `web/test/gcp.test.mjs` + `web/test/fixtures/andes-vv-gcps.json` (210-pt
-  gdalinfo dump). `node web/test/gcp.test.mjs` → **8/8 pass**: forward
-  reproduces every GCP node to <1e-9°, inverse round-trips <1px.
-- These are the geolocation core that work item C consumes. **They are correct
-  and validated — reuse them, do not rebuild.**
+**What landed (all committed, reuse, do not rebuild):**
+- `web/src/gcpTileset.ts` — `GcpTilesetLevel` (implements `RasterTilesetLevel`)
+  + `buildGcpDescriptor()`. The non-affine twin of `AffineTilesetLevel`; every
+  pixel<->CRS step routes through `gcp.ts` forward/inverse. Source CRS is 4326
+  so projection fns are identity-to-4326 + analytic mercator-to-3857 (no proj4).
+- `web/src/GcpMultiCOGLayer.ts` — subclasses `MultiCOGLayer`, overrides ONLY
+  `_parseAllSources` to build the GCP descriptor. `neutralizeAffine()` shadows
+  the geotiff lib's throwing `transform` getter (it computes a per-tile affine
+  during decode that our render path never reads; without this it throws "The
+  image does not have an affine transformation" on every tile).
+- `web/src/gcp.ts` — A+B unchanged, PLUS `inverse()` now Newton-solves only the
+  cell(s) whose precomputed lon/lat bbox contains the point (not all ~180). The
+  reprojection mesh calls inverse per vertex, so the old full scan stuttered.
+- `stac.ts` repointed to Earth Search `sentinel-1-grd` (IW filter, s3→https
+  rewrite). `shaders/amplitude.ts` → `20*log10(DN/65535)`, nodata 0, r16unorm.
+  `renderPipeline` dB window −65..−45; prefs key v3.
+- `App.tsx` — layer swapped to `GcpMultiCOGLayer`; `maxError: 0.75` (coarse mesh,
+  the warp is smooth so it looks identical with far fewer triangles).
 
-**Zarr track is DEAD (confirmed, do not reopen without a proxy):** `objects.eodc.eu`
-sends NO CORS on any bucket and 403s preflights → browser-blocked, exact DE
-Africa wall. STAC API is CORS-open but points data back at the no-CORS store;
-EOPF explorer only renders via server-side TiTiler. Full detail in MEMORY.md.
-Stephen's call: build the COG GCP-warp. (Zarr only made item A easier anyway.)
+**Fetching is MANUAL (Stephen's explicit ask):** nothing loads on page load, on
+geocode, or on a date edit. Only FETCH VIEW and DRAW AOI call `runFetch(bbox)`.
+A `fetchGen` counter is folded into the layer ids so the MosaicLayer + inner
+TileLayer REMOUNT each fetch — without it, a FETCH VIEW that doesn't move the
+viewport never reloads (TileLayer only re-traverses on a viewport/prop change).
 
-**Verified live data target (use this exact scene to first render):**
-- Earth Search POST `https://earth-search.aws.element84.com/v1/search`,
-  collection `sentinel-1-grd`, `query:{sar:instrument_mode:{eq:"IW"}}`.
-- Andes VV COG (s3→https rewrite to
-  `https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/<key>`):
-  `GRD/2026/6/5/IW/DV/S1A_IW_GRDH_1SDV_20260605T232821_20260605T232846_064840_082B9D_B7BE/measurement/iw-vv.tiff`
-- **CORS-open** (anonymous 206, `ACAO:*`, `image/tiff`). 26117×16884, **UInt16
-  amplitude**, nodata 0, **6 overviews**, **NO affine**, 210 GCPs in
-  ModelTiepoint tag 33922 (1260 doubles, no `_GDAL_GCPs` variant). dB stretch
-  that looked right offline: `20*log10(DN/65535)`, ~−65→−45 dB, mild gamma.
+**Verified data target (the default view):** Earth Search `sentinel-1-grd`, IW,
+Andes 2026-06-05 scene `S1A_IW_GRDH_1SDV_20260605T232821...`. `sentinel-s1-l1c`
+bucket is CORS-open (anonymous 206, `ACAO:*`). 26117×16884 UInt16 amplitude,
+nodata 0, 6 overviews, NO affine, 210 GCPs in ModelTiepoint tag 33922.
 
-**Remaining = work items C then D below.** C is the hard part (the deck.gl-raster
-non-affine tileset the lib flagged as "future"). If C proves deep/uncertain,
-the pragmatic fallback that still ships a real in-repo browser tool: do the warp
-client-side with `gcp.ts` (read a COG overview via `@developmentseed/geotiff`,
-warp into a canvas with `inverse()`, apply dB) and drape it as a deck.gl
-`BitmapLayer` over its 3857 bounds. Less elegant than the mesh tileset, but it
-renders in the actual app and reuses A+B. Pick whichever gets a runnable viz
-soonest — that is what Stephen wants.
+**KNOWN OPEN (next session):**
+- **Seams when zoomed in.** Each tile reprojects with its own independent mesh,
+  so adjacent tiles triangulate their shared edge slightly differently → hairline
+  cracks. Cosmetic. Proper fix = share edge vertices across tiles (deeper).
+- **dB default may read dark** depending on the scene's DN range; the slider /
+  DRAMATIC preset tunes it. Confirm the default window looks right per-region.
+- Zarr track is DEAD (no CORS on `objects.eodc.eu`; see MEMORY.md). Do not reopen.
 
 ---
 

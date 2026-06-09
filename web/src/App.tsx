@@ -109,6 +109,12 @@ export default function App() {
   const [drawing, setDrawing] = useState(false);
   const [stats, setStats] = useState<LoadStats>({ loaded: 0, failed: 0, failures: [] });
   const [zoom, setZoom] = useState<number>(8);
+  // Bumped on every manual fetch. Folded into the layer ids so the MosaicLayer
+  // (and its inner TileLayer) remounts and re-traverses each fetch. Without it a
+  // FETCH VIEW that doesn't move the viewport never reloads: TileLayer only
+  // re-runs getTileIndices on a viewport/prop change, so new scenes for the same
+  // view would silently never appear.
+  const [fetchGen, setFetchGen] = useState(0);
 
   // Mirror the module-level load scoreboard into React state.
   useEffect(() => subscribeStats(setStats), []);
@@ -191,6 +197,7 @@ export default function App() {
       setStacError(null);
       setFetching(true);
       setHasFetched(true);
+      setFetchGen((g) => g + 1);
       resetStats();
       fetchStacItems({
         datetime: datetimeOf(dateFrom, dateTo),
@@ -283,7 +290,7 @@ export default function App() {
     const pipeline = buildRenderPipeline({ dbRange, gamma });
 
     const mosaic = new MosaicLayer<PartialSTACItem, null>({
-      id: `s1-mosaic-${pol}-${gen}`,
+      id: `s1-mosaic-${pol}-${gen}-${fetchGen}`,
       sources: polItems,
       maxCacheSize: 0,
       // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
@@ -299,7 +306,7 @@ export default function App() {
           sourcesCache.current.set(cacheKey, sources);
         }
         return new GcpMultiCOGLayer({
-          id: `s1-multi-${pol}-${gen}-${source.id}`,
+          id: `s1-multi-${pol}-${gen}-${fetchGen}-${source.id}`,
           sources,
           composite: AMP_COMPOSITE,
           renderPipeline: pipeline,
@@ -325,7 +332,7 @@ export default function App() {
       beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [polItems, labelBeforeId, pol, gen, dbRange, gamma]);
+  }, [polItems, labelBeforeId, pol, gen, fetchGen, dbRange, gamma]);
 
   const initialViewState = {
     longitude: -70.05,
