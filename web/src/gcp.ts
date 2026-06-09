@@ -104,8 +104,22 @@ export function buildGcpGrid(gcps: Gcp[]): GcpGrid {
     lat[r][c] = g.lat;
   }
 
-  // Precompute each cell's lon/lat bbox (min/max over its 4 corners) so the
-  // inverse can cheaply reject the cells that can't contain a query point.
+  return finalizeGrid(cols, rows, lon, lat);
+}
+
+/**
+ * Assemble a {@link GcpGrid} from coordinate axes and node positions, computing
+ * the per-cell lon/lat bbox index. Shared by {@link buildGcpGrid} and
+ * {@link padGcpGridLinear}.
+ */
+function finalizeGrid(
+  cols: number[],
+  rows: number[],
+  lon: number[][],
+  lat: number[][],
+): GcpGrid {
+  const C = cols.length;
+  const R = rows.length;
   const cellLonMin: number[][] = [];
   const cellLonMax: number[][] = [];
   const cellLatMin: number[][] = [];
@@ -124,12 +138,95 @@ export function buildGcpGrid(gcps: Gcp[]): GcpGrid {
       cellLatMax[r][c] = Math.max(la0, la1, la2, la3);
     }
   }
-
   return {
     cols, rows, lon, lat,
     width: cols[C - 1], height: rows[R - 1],
     cellLonMin, cellLonMax, cellLatMin, cellLatMax,
   };
+}
+
+/**
+ * Return a copy of `grid` ringed by one extrapolated ghost row/column on every
+ * side, so the warp stays well-defined far outside the image without the
+ * bilinear cross-term blowing up.
+ *
+ * Why this exists: COG tiles are boundless (padded past the image edge), and at
+ * coarse overviews a single tile is mostly padding mapping FAR beyond the grid.
+ * Plain bilinear extrapolation there is quadratic (the `u*t` cross term), so the
+ * reprojection mesh can never approximate it under its error target and spins to
+ * its iteration cap on every tile — the app's sluggishness. The ghost nodes are
+ * placed by a SINGLE averaged edge gradient per side (and the sum at corners),
+ * which makes every ghost cell a parallelogram; bilinear over a parallelogram is
+ * exactly affine, so extrapolation is linear and the mesh converges immediately,
+ * exactly like an affine geotransform.
+ *
+ * The interior is copied unchanged, so `forward`/`inverse` are identical there.
+ * `width`/`height` and dataset bounds must still be derived from the ORIGINAL
+ * grid (the caller does this before padding) — the ghost ring is geometry-only.
+ */
+export function padGcpGridLinear(grid: GcpGrid): GcpGrid {
+  const { cols, rows, lon, lat } = grid;
+  const C = cols.length;
+  const R = rows.length;
+  const colMargin = cols[C - 1] - cols[0];
+  const rowMargin = rows[R - 1] - rows[0];
+
+  // Averaged per-pixel edge gradients (constant across the edge → parallelogram
+  // ghost cells → affine extrapolation).
+  const gapR = cols[C - 1] - cols[C - 2];
+  const gapL = cols[1] - cols[0];
+  const gapT = rows[1] - rows[0];
+  const gapB = rows[R - 1] - rows[R - 2];
+  let gRx = 0, gRy = 0, gLx = 0, gLy = 0;
+  for (let r = 0; r < R; r++) {
+    gRx += (lon[r][C - 1] - lon[r][C - 2]); gRy += (lat[r][C - 1] - lat[r][C - 2]);
+    gLx += (lon[r][1] - lon[r][0]); gLy += (lat[r][1] - lat[r][0]);
+  }
+  gRx /= R * gapR; gRy /= R * gapR; gLx /= R * gapL; gLy /= R * gapL;
+  let gTx = 0, gTy = 0, gBx = 0, gBy = 0;
+  for (let c = 0; c < C; c++) {
+    gTx += (lon[1][c] - lon[0][c]); gTy += (lat[1][c] - lat[0][c]);
+    gBx += (lon[R - 1][c] - lon[R - 2][c]); gBy += (lat[R - 1][c] - lat[R - 2][c]);
+  }
+  gTx /= C * gapT; gTy /= C * gapT; gBx /= C * gapB; gBy /= C * gapB;
+
+  // Offsets to move a node from the edge out to the ghost ring (per side).
+  const dLx = -gLx * colMargin, dLy = -gLy * colMargin; // left  (toward -col)
+  const dRx = gRx * colMargin, dRy = gRy * colMargin;   // right (toward +col)
+  const dTx = -gTx * rowMargin, dTy = -gTy * rowMargin; // top   (toward -row)
+  const dBx = gBx * rowMargin, dBy = gBy * rowMargin;   // bottom(toward +row)
+
+  const newCols = [cols[0] - colMargin, ...cols, cols[C - 1] + colMargin];
+  const newRows = [rows[0] - rowMargin, ...rows, rows[R - 1] + rowMargin];
+  const nC = C + 2;
+  const nR = R + 2;
+  const nlon: number[][] = Array.from({ length: nR }, () => new Array(nC).fill(0));
+  const nlat: number[][] = Array.from({ length: nR }, () => new Array(nC).fill(0));
+
+  // interior copy
+  for (let r = 0; r < R; r++) {
+    for (let c = 0; c < C; c++) {
+      nlon[r + 1][c + 1] = lon[r][c];
+      nlat[r + 1][c + 1] = lat[r][c];
+    }
+  }
+  // left / right ghost columns
+  for (let r = 0; r < R; r++) {
+    nlon[r + 1][0] = lon[r][0] + dLx; nlat[r + 1][0] = lat[r][0] + dLy;
+    nlon[r + 1][nC - 1] = lon[r][C - 1] + dRx; nlat[r + 1][nC - 1] = lat[r][C - 1] + dRy;
+  }
+  // top / bottom ghost rows
+  for (let c = 0; c < C; c++) {
+    nlon[0][c + 1] = lon[0][c] + dTx; nlat[0][c + 1] = lat[0][c] + dTy;
+    nlon[nR - 1][c + 1] = lon[R - 1][c] + dBx; nlat[nR - 1][c + 1] = lat[R - 1][c] + dBy;
+  }
+  // corners (sum of the two adjacent edge offsets → parallelogram corner cells)
+  nlon[0][0] = lon[0][0] + dLx + dTx; nlat[0][0] = lat[0][0] + dLy + dTy;
+  nlon[0][nC - 1] = lon[0][C - 1] + dRx + dTx; nlat[0][nC - 1] = lat[0][C - 1] + dRy + dTy;
+  nlon[nR - 1][0] = lon[R - 1][0] + dLx + dBx; nlat[nR - 1][0] = lat[R - 1][0] + dLy + dBy;
+  nlon[nR - 1][nC - 1] = lon[R - 1][C - 1] + dRx + dBx; nlat[nR - 1][nC - 1] = lat[R - 1][C - 1] + dRy + dBy;
+
+  return finalizeGrid(newCols, newRows, nlon, nlat);
 }
 
 /**

@@ -27,7 +27,7 @@ import type {
 import type { GeoTIFF, Overview } from "@developmentseed/geotiff";
 import { makeClampedForwardTo3857 } from "@developmentseed/proj";
 
-import { buildGcpGrid, forward, inverse, parseGcps, type GcpGrid } from "./gcp";
+import { buildGcpGrid, forward, inverse, padGcpGridLinear, parseGcps, type GcpGrid } from "./gcp";
 
 /** A 2D point [x, y], matching deck.gl-raster's (non-exported) `Point`. */
 type Point = [number, number];
@@ -233,7 +233,12 @@ export function buildGcpDescriptor(geotiff: GeoTIFF): RasterTilesetDescriptor {
     throw new Error("GRD COG has no ModelTiepoint tag, no GCP geolocation to place it");
   }
   const grid = buildGcpGrid(parseGcps(tiepoints));
+  // Bounds come from the REAL grid (the image extent), before padding.
   const bounds = gridBounds(grid);
+  // The levels drive forward/inverse with a linearly-extrapolated (affine) ghost
+  // ring so boundless-tile padding past the image edge stays affine and the
+  // reprojection mesh converges instead of spinning on the bilinear cross-term.
+  const paddedGrid = padGcpGridLinear(grid);
   const fullWidth = geotiff.width;
   const fullHeight = geotiff.height;
 
@@ -246,7 +251,7 @@ export function buildGcpDescriptor(geotiff: GeoTIFF): RasterTilesetDescriptor {
   const levels = images.map(
     (img) =>
       new GcpTilesetLevel({
-        grid,
+        grid: paddedGrid,
         fullWidth,
         fullHeight,
         arrayWidth: img.width,
