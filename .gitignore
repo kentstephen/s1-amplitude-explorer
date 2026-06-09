@@ -1,0 +1,15 @@
+# Dependencies / build
+node_modules
+dist
+.vite
+*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Local Claude state (memory is workspace-local and not for the repo)
+.claude/memory/
+.claude/settings.local.json
+
+# Scratch images / research exports
+web/images/

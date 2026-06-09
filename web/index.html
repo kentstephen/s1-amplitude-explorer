@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sentinel-1 Amplitude Explorer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /* Single fixed-viewport app: never let the page itself scroll, and keep
+         the background dark so no white shows if a child reaches the edge. */
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        background: #0a0d12;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      /* 100dvh tracks the real visible height (mobile URL bars etc.). */
+      #root { width: 100vw; height: 100vh; height: 100dvh; }
+
+      /* Dual-thumb range slider (Radix Slider primitive). Styled to match
+         the native browser sliders elsewhere in the panel, which use
+         accentColor = #7dd3c0 (UI.accent). */
+      .range-slider-root {
+        position: relative;
+        display: flex;
+        align-items: center;
+        user-select: none;
+        touch-action: none;
+        width: 100%;
+        height: 22px;
+        margin-top: 4px;
+      }
+      .range-slider-track {
+        position: relative;
+        flex-grow: 1;
+        height: 6px;
+        border-radius: 3px;
+        background: #3a4452;
+      }
+      .range-slider-range {
+        position: absolute;
+        height: 100%;
+        border-radius: 3px;
+        background: #7dd3c0;
+      }
+      .range-slider-thumb {
+        display: block;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #7dd3c0;
+        border: none;
+        cursor: pointer;
+        outline: none;
+      }
+      .range-slider-thumb:focus-visible {
+        box-shadow: 0 0 0 3px rgba(125, 211, 192, 0.35);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

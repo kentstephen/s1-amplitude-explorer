@@ -1,0 +1,265 @@
+/**
+ * Direct Sentinel-2 L2A scenes from Element 84's public Earth Search STAC
+ * (AWS Open Data `sentinel-cogs` bucket, us-west-2). Browser-friendly:
+ * CORS-open (ACAO:*, HEAD/GET, range → 206), no auth, no requester-pays.
+ *
+ * This module is a small STAC client for the instrument: a free date range + a
+ * cloud-cover filter over the AOI returns the RAW candidate scenes (footprints +
+ * date + cloud + bands), which the UI previews (step by date) and then composites
+ * coverage-first. No season/year presets — the user drives the window.
+ *
+ * Three pure stages:
+ *   1. `fetchS2Candidates` — one STAC POST → `S2Scene[]` (footprint, date, cloud).
+ *   2. `selectCoverageFirst` — pure client selection guaranteeing every MGRS tile
+ *      in the AOI is covered, then cloud-fill, ordered for the MosaicLayer stack.
+ *   3. render (App): MosaicLayer(items) → per-mode MultiCOGLayer + SCL mask.
+ */
+
+import type { PartialSTACItem } from "./stac";
+import type { BandKey } from "./renderPipeline";
+
+const EARTH_SEARCH = "https://earth-search.aws.element84.com/v1/search";
+const COLLECTION = "sentinel-2-l2a";
+
+// Earth Search L2A asset key → our internal B-key. Only the ones we render.
+const ASSET_TO_BAND: Record<string, BandKey> = {
+  coastal: "B01",
+  blue: "B02",
+  green: "B03",
+  red: "B04",
+  rededge1: "B05",
+  rededge2: "B06",
+  rededge3: "B07",
+  nir: "B08",
+  nir08: "B8A",
+  swir16: "B11",
+  swir22: "B12",
+  // Scene Classification Layer (20 m). NOT a spectral band — a per-pixel class
+  // map (0 nodata, 3 cloud-shadow, 8/9 cloud med/high, 10 cirrus, 11 snow/ice).
+  // Carried as a band so the cloud-masked composite can sample it on the GPU and
+  // discard cloud classes (keeping 11 — snow/ice).
+  scl: "SCL",
+};
+
+/** A GeoJSON Polygon/MultiPolygon footprint (loosely typed to avoid a dep). */
+export type Footprint = {
+  type: "Polygon" | "MultiPolygon";
+  coordinates: number[][][] | number[][][][];
+};
+
+type ESFeature = {
+  id: string;
+  bbox: [number, number, number, number];
+  geometry?: Footprint;
+  assets: Record<string, { href?: string }>;
+  properties?: {
+    datetime?: string;
+    "eo:cloud_cover"?: number;
+    /** e.g. "MGRS-5VNK" — the authoritative tile id when present. */
+    "grid:code"?: string;
+  };
+};
+
+/** A raw candidate scene: enough to preview (footprint/date/cloud) and to render
+ * (mapped band assets). One per Earth Search feature, no dedup. */
+export type S2Scene = {
+  item: PartialSTACItem;
+  geometry: Footprint | null;
+  /** Acquisition date YYYY-MM-DD. */
+  date: string;
+  /** Cloud cover % (100 if unknown). */
+  cloud: number;
+  /** MGRS tile id ("5VNK") — the coverage footprint group. */
+  tile: string;
+};
+
+/** MGRS tile id for grouping overpasses by footprint. Prefers the `grid:code`
+ * property ("MGRS-5VNK"); falls back to the scene id (zone is 1 OR 2 digits,
+ * e.g. `S2B_5VNK_...` → `5VNK`), then a rounded-bbox key. */
+function tileKey(f: ESFeature): string {
+  const grid = f.properties?.["grid:code"];
+  if (grid) return grid.replace(/^MGRS-/, "");
+  const m = /_T?(\d{1,2}[A-Z]{3})_/.exec(f.id);
+  if (m) return m[1];
+  return f.bbox.map((v) => Math.round(v * 10) / 10).join(",");
+}
+
+function mapItem(f: ESFeature): PartialSTACItem | null {
+  const visual = f.assets["visual"]?.href ?? f.assets["TCI"]?.href;
+  if (!visual) return null;
+  const assets: PartialSTACItem["assets"] = { visual: { href: visual } };
+  for (const [esKey, bandKey] of Object.entries(ASSET_TO_BAND)) {
+    const href = f.assets[esKey]?.href;
+    if (href) assets[bandKey] = { href };
+  }
+  return { id: f.id, bbox: f.bbox, assets };
+}
+
+export type FetchCandidatesOptions = {
+  bbox: [number, number, number, number];
+  /** Inclusive ISO date (YYYY-MM-DD) start of the window. */
+  dateFrom: string;
+  /** Inclusive ISO date (YYYY-MM-DD) end of the window. */
+  dateTo: string;
+  /** Max cloud cover % a candidate may have. Default 100 (no filter). */
+  maxCloud?: number;
+  signal?: AbortSignal;
+};
+
+/**
+ * Query Earth Search for ALL candidate L2A scenes over the AOI within the date
+ * range + cloud filter. Returns raw scenes sorted clearest-first. No selection,
+ * no dedup — the UI previews these and `selectCoverageFirst` composites them.
+ */
+/** Coerce a value to a valid YYYY-MM-DD, or null. Date `<input>`s can emit empty
+ *  or partial-year values mid-edit (e.g. "0002-...") which Earth Search rejects
+ *  with a 400; we sanitize before building the interval. */
+function normDate(v: string, fallback: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return fallback;
+  const year = Number(v.slice(0, 4));
+  // Sentinel-2 starts 2015; clamp absurd years (partial typing) into range.
+  if (year < 2015 || year > 2100) return fallback;
+  return v;
+}
+
+export async function fetchS2Candidates(
+  opts: FetchCandidatesOptions,
+): Promise<S2Scene[]> {
+  const { bbox, maxCloud = 100, signal } = opts;
+  // Sanitize + order the window so a mid-edit reversed/empty range can't 400.
+  let from = normDate(opts.dateFrom, "2018-01-01");
+  let to = normDate(opts.dateTo, "2026-12-31");
+  if (from > to) [from, to] = [to, from];
+  const datetime = `${from}T00:00:00Z/${to}T23:59:59Z`;
+  const res = await fetch(EARTH_SEARCH, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      collections: [COLLECTION],
+      bbox,
+      datetime,
+      ...(maxCloud < 100
+        ? { query: { "eo:cloud_cover": { lt: maxCloud } } }
+        : {}),
+      // Earth Search caps page size at 100 (over → 502). Clearest-first.
+      limit: 100,
+      sortby: [{ field: "properties.eo:cloud_cover", direction: "asc" }],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Earth Search failed: ${res.status} ${res.statusText}`);
+  }
+  const fc = (await res.json()) as { features: ESFeature[] };
+  if (!fc.features?.length) return [];
+  const scenes: S2Scene[] = [];
+  for (const f of fc.features) {
+    const item = mapItem(f);
+    if (!item) continue;
+    scenes.push({
+      item,
+      geometry: f.geometry ?? null,
+      date: (f.properties?.datetime ?? "").slice(0, 10),
+      cloud: f.properties?.["eo:cloud_cover"] ?? 100,
+      tile: tileKey(f),
+    });
+  }
+  return scenes;
+}
+
+export type CoverageSelection = {
+  /** Scenes ordered so each tile's CLEAREST date lands LAST (drawn on top);
+   * cloudier dates sit earlier (below). The SCL mask punches the top scene's
+   * clouds/nodata so the clear date beneath fills the hole. */
+  items: PartialSTACItem[];
+  /** Distinct acquisition dates contributing, newest first. */
+  dates: string[];
+  /** Lowest cloud cover % among contributing scenes. */
+  bestCloud: number | null;
+  /** Count of MGRS tiles represented (= AOI footprints covered). */
+  tilesCovered: number;
+};
+
+export type SelectOptions = {
+  /** Hard cap on scenes fed to the mosaic (each = open GeoTIFF + GPU textures).
+   *  Coverage is reserved first, so the cap only trims extra cloud-fill dates. */
+  maxScenes?: number;
+  /** Up to this many clearest dates kept per MGRS tile (fills within-tile nodata
+   *  swath edges + cloud holes). */
+  perTile?: number;
+  /** Scene ids to exclude (the "refine" path — drop scenes after auto-select). */
+  excludeIds?: Set<string>;
+};
+
+/**
+ * COVERAGE-FIRST selection over candidate scenes. Groups by MGRS tile, keeps the
+ * `perTile` clearest dates per tile, RESERVES each tile's clearest scene before
+ * the budget cap (so the cap can never zero out a tile = no bare gap), then fills
+ * remaining budget with the clearest leftover dates. Orders clearest-LAST per
+ * tile for the MosaicLayer stack. Pure — no network.
+ */
+export function selectCoverageFirst(
+  scenes: S2Scene[],
+  opts: SelectOptions = {},
+): CoverageSelection {
+  const { maxScenes = 18, perTile = 4, excludeIds } = opts;
+  const usable = excludeIds
+    ? scenes.filter((s) => !excludeIds.has(s.item.id))
+    : scenes;
+  if (!usable.length)
+    return { items: [], dates: [], bestCloud: null, tilesCovered: 0 };
+
+  // Group by tile; candidates are clearest-first, so keep up to perTile distinct
+  // dates per tile (dedupe by date so we never stack the same overpass on itself).
+  const byTile = new Map<string, S2Scene[]>();
+  for (const s of usable) {
+    const kept = byTile.get(s.tile) ?? [];
+    if (kept.some((k) => k.date === s.date)) continue;
+    if (kept.length >= perTile) continue;
+    kept.push(s);
+    byTile.set(s.tile, kept);
+  }
+
+  const tiles = [...byTile.values()];
+  const tilesCovered = tiles.length;
+  // Reserve each tile's clearest (coverage base, drawn on top).
+  const reserved = tiles.map((t) => t[0]);
+  // Remaining dates per tile (cloud-fill, stacked beneath); clearest first.
+  const fill = tiles.flatMap((t) => t.slice(1)).sort((a, b) => a.cloud - b.cloud);
+  const fillBudget = Math.max(0, maxScenes - reserved.length);
+  const chosen = [...fill.slice(0, fillBudget), ...reserved];
+  // Render order: cloudiest FIRST (bottom), clearest LAST (top).
+  chosen.sort((a, b) => b.cloud - a.cloud);
+
+  const items = chosen.map((s) => s.item);
+  const dates = [...new Set(chosen.map((s) => s.date))]
+    .filter(Boolean)
+    .sort()
+    .reverse();
+  const bestCloud = chosen.length
+    ? Math.min(...chosen.map((s) => s.cloud))
+    : null;
+  return { items, dates, bestCloud, tilesCovered };
+}
+
+/** Group candidate scenes by acquisition date for the step-by-date preview, with
+ * the BEST-COVERAGE dates up front: ordered by distinct MGRS tiles that date's
+ * scenes cover (desc), then by recency. So stepping starts at the date that fills
+ * the most of the AOI on its own. */
+export function groupByDate(
+  scenes: S2Scene[],
+): { date: string; scenes: S2Scene[]; tiles: number }[] {
+  const map = new Map<string, S2Scene[]>();
+  for (const s of scenes) {
+    const arr = map.get(s.date) ?? [];
+    arr.push(s);
+    map.set(s.date, arr);
+  }
+  return [...map.entries()]
+    .map(([date, scenes]) => ({
+      date,
+      scenes,
+      tiles: new Set(scenes.map((s) => s.tile)).size,
+    }))
+    .sort((a, b) => b.tiles - a.tiles || (a.date < b.date ? 1 : -1));
+}
