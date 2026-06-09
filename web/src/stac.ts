@@ -1,25 +1,25 @@
 /**
- * Runtime STAC client for Sentinel-1 RTC backscatter on the Microsoft Planetary
- * Computer (`sentinel-1-rtc`). Pages through /search and returns the minimal
- * shape the MosaicLayer needs: bbox + the VV / VH COG asset hrefs.
+ * Runtime STAC client for raw Sentinel-1 GRD over Element 84's public Earth
+ * Search (`sentinel-1-grd`). Pages through /search and returns the minimal shape
+ * the layer needs: bbox + the VV / VH measurement-COG hrefs.
  *
- * Why RTC and not raw GRD: the Earth Search / EOPF GRD products are ground-range
- * with GCP geolocation (no affine grid), which deck.gl-geotiff can't place yet
- * (GCP warping is a roadmap item — see docs/RESEARCH.md). RTC is terrain-
- * corrected onto a real UTM affine grid, so it renders via the existing
- * epsgResolver path. Trade-off: RTC flattens some of the dramatic relief shading,
- * and MPC blob storage throttles on bursts.
+ * Why raw GRD and not RTC: GRD is open, global, and browser-readable with no
+ * auth (the `sentinel-s1-l1c` bucket is CORS-open, anonymous 206 range reads).
+ * The catch is geometry, GRD COGs are ground-range with a GCP grid and no
+ * affine transform, so they only render through the GCP tileset path
+ * (`gcpTileset.ts` / `GcpMultiCOGLayer`), not deck.gl-geotiff's affine default.
+ * RTC was the affine shortcut; it's gated/throttled (MPC SAS + 504s), so we
+ * dropped it. See docs/PLAN.md.
  *
- * Access: assets are Azure blob URLs needing a SAS token. We fetch ONE container
- * token for the whole collection (`/api/sas/v1/token/sentinel-1-rtc`, CORS-open,
- * ~1 hr expiry) and append it to every href — one signing call per search, which
- * keeps us under the throttle. The token expiry is surfaced so the app can
- * refetch when it lapses.
+ * Access: assets carry `s3://sentinel-s1-l1c/...` hrefs; we rewrite them to the
+ * CORS-open https virtual-hosted endpoint. No token, no requester-pays.
  */
 
-const MPC_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1/search";
-const MPC_TOKEN = "https://planetarycomputer.microsoft.com/api/sas/v1/token/sentinel-1-rtc";
-const COLLECTION = "sentinel-1-rtc";
+const EARTH_SEARCH = "https://earth-search.aws.element84.com/v1/search";
+const COLLECTION = "sentinel-1-grd";
+// CORS-open virtual-hosted endpoint for the AWS Open Data S1 L1C bucket
+// (eu-central-1): anonymous range reads, `Access-Control-Allow-Origin: *`.
+const S1_BUCKET_HTTPS = "https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/";
 
 export type Polarization = "vv" | "vh";
 
@@ -31,7 +31,7 @@ export type PartialSTACItem = {
   /** Ascending / descending pass; affects look-direction and relief shading. */
   orbit: "ascending" | "descending" | null;
   assets: {
-    /** SAS-signed blob href; present only when the scene carries that pol. */
+    /** https measurement-COG href; present only when the scene carries that pol. */
     vv?: { href: string };
     vh?: { href: string };
   };
@@ -53,11 +53,11 @@ type StacFeatureCollection = {
 };
 
 export type FetchOptions = {
-  /** Datetime interval in RFC3339, e.g. "2024-01-01T00:00:00Z/2024-03-01T23:59:59Z" */
+  /** Datetime interval in RFC3339, e.g. "2026-01-01T00:00:00Z/2026-03-01T23:59:59Z" */
   datetime: string;
-  /** bbox [W,S,E,N] — global collection, so an AOI is effectively required. */
+  /** bbox [W,S,E,N], global collection, so an AOI is effectively required. */
   bbox?: [number, number, number, number];
-  /** Hard cap on items fetched (safety net; RTC scenes are big, keep modest). */
+  /** Hard cap on items fetched (safety net; GRD scenes are ~650 MB COGs). */
   maxItems?: number;
   signal?: AbortSignal;
 };
@@ -66,14 +66,14 @@ export type FetchResult = {
   items: PartialSTACItem[];
   /** Scenes dropped because they carried no usable VV/VH asset. */
   rejected: number;
-  /** SAS token expiry (ISO) so the caller can refetch before it lapses. */
+  /** Kept for caller compatibility; always null for the token-free GRD source. */
   tokenExpiry: string | null;
 };
 
 /**
- * fetch with retry/backoff on throttle/transient failures. MPC's STAC + SAS
- * endpoints 429/5xx under burst; a couple of backed-off retries usually clears
- * it. Aborts (user navigation) are not retried.
+ * fetch with retry/backoff on transient failures. Earth Search occasionally
+ * 502/503s under load; a couple of backed-off retries usually clears it.
+ * Aborts (user navigation) are not retried.
  */
 async function fetchRetry(
   url: string,
@@ -85,7 +85,6 @@ async function fetchRetry(
     try {
       const res = await fetch(url, init);
       if (res.ok) return res;
-      // Retry only on throttle / gateway / transient server errors.
       if (![429, 502, 503, 504].includes(res.status) || i === tries - 1) return res;
     } catch (e) {
       if ((e as Error)?.name === "AbortError") throw e;
@@ -97,18 +96,13 @@ async function fetchRetry(
   throw lastErr ?? new Error("fetchRetry exhausted");
 }
 
-/** One container SAS token for the whole collection; append to each blob href. */
-async function fetchSasToken(signal?: AbortSignal): Promise<{ token: string; expiry: string | null }> {
-  const res = await fetchRetry(MPC_TOKEN, { signal });
-  if (!res.ok) throw new Error(`SAS token failed: ${res.status} ${res.statusText}`);
-  const j = (await res.json()) as { token?: string; "msft:expiry"?: string };
-  if (!j.token) throw new Error("SAS token response missing `token`");
-  return { token: j.token, expiry: j["msft:expiry"] ?? null };
-}
-
-function sign(href: string | undefined, token: string): string | null {
+/** Rewrite an `s3://sentinel-s1-l1c/KEY` href to the CORS-open https endpoint. */
+function s3ToHttps(href: string | undefined): string | null {
   if (!href) return null;
-  return href.includes("?") ? `${href}&${token}` : `${href}?${token}`;
+  const m = /^s3:\/\/sentinel-s1-l1c\/(.+)$/.exec(href);
+  if (m) return S1_BUCKET_HTTPS + m[1];
+  // Already https (or some other scheme we pass through unchanged).
+  return href.startsWith("http") ? href : null;
 }
 
 function orbitOf(f: StacFeature): PartialSTACItem["orbit"] {
@@ -117,12 +111,12 @@ function orbitOf(f: StacFeature): PartialSTACItem["orbit"] {
 }
 
 /**
- * Page through MPC search for RTC scenes over the AOI, signing each VV/VH href
- * with the container token. Scenes with neither pol are dropped.
+ * Page through Earth Search for IW-mode GRD scenes over the AOI, rewriting each
+ * VV/VH measurement href to the https bucket endpoint. Scenes with neither pol
+ * are dropped.
  */
 export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
-  const { datetime, bbox, maxItems = 60, signal } = opts;
-  const { token, expiry } = await fetchSasToken(signal);
+  const { datetime, bbox, maxItems = 24, signal } = opts;
 
   const items: PartialSTACItem[] = [];
   let rejected = 0;
@@ -130,12 +124,14 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
   const body: Record<string, unknown> = {
     collections: [COLLECTION],
     datetime,
+    // GRD only; SLC (complex) and other modes are not amplitude imagery.
+    query: { "sar:instrument_mode": { eq: "IW" } },
     limit: 100,
     sortby: [{ field: "properties.datetime", direction: "desc" }],
   };
   if (bbox) body.bbox = bbox;
 
-  let url: string | null = MPC_STAC;
+  let url: string | null = EARTH_SEARCH;
   let nextBody: Record<string, unknown> | null = body;
 
   while (url && items.length < maxItems) {
@@ -149,8 +145,8 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
     const fc = (await res.json()) as StacFeatureCollection;
 
     for (const feat of fc.features) {
-      const vv = sign(feat.assets["vv"]?.href, token);
-      const vh = sign(feat.assets["vh"]?.href, token);
+      const vv = s3ToHttps(feat.assets["vv"]?.href);
+      const vh = s3ToHttps(feat.assets["vh"]?.href);
       if (!vv && !vh) {
         rejected += 1;
         continue;
@@ -177,5 +173,5 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
     }
   }
 
-  return { items, rejected, tokenExpiry: expiry };
+  return { items, rejected, tokenExpiry: null };
 }

@@ -1,6 +1,6 @@
 /**
  * Persist the amplitude render-look knobs (polarization, dB window, gamma) to
- * localStorage so a reload keeps the user's choices. Scoped to look only — not
+ * localStorage so a reload keeps the user's choices. Scoped to look only, not
  * AOI or date window, which are navigational.
  */
 import {
@@ -9,7 +9,8 @@ import {
 } from "./renderPipeline";
 import type { Polarization } from "./stac";
 
-const KEY = "s1amp.lookPrefs.v2";
+// v3: GRD amplitude dB scale (20·log10(DN/65535)); supersedes the v2 RTC window.
+const KEY = "s1amp.lookPrefs.v3";
 
 export type LookPrefs = {
   pol: Polarization;
@@ -47,6 +48,6 @@ export function saveLookPrefs(prefs: LookPrefs): void {
   try {
     localStorage.setItem(KEY, JSON.stringify(prefs));
   } catch {
-    /* private mode / quota — preferences just won't persist */
+    /* private mode / quota, preferences just won't persist */
   }
 }

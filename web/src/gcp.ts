@@ -62,6 +62,17 @@ export interface GcpGrid {
   lat: number[][]; // [R][C]
   width: number; // cols[C-1] (max pixel)
   height: number; // rows[R-1] (max line)
+  /**
+   * Per-cell lon/lat bounding boxes, indexed `[r][c]` over the (R-1)x(C-1)
+   * cells. Lets {@link inverse} Newton-solve only the cell(s) that actually
+   * contain a query point instead of every cell, the difference between a
+   * usable warp and a stuttering one, since the reprojection mesh calls
+   * `inverse` per candidate vertex.
+   */
+  cellLonMin: number[][];
+  cellLonMax: number[][];
+  cellLatMin: number[][];
+  cellLatMax: number[][];
 }
 
 /**
@@ -92,7 +103,33 @@ export function buildGcpGrid(gcps: Gcp[]): GcpGrid {
     lon[r][c] = g.lon;
     lat[r][c] = g.lat;
   }
-  return { cols, rows, lon, lat, width: cols[C - 1], height: rows[R - 1] };
+
+  // Precompute each cell's lon/lat bbox (min/max over its 4 corners) so the
+  // inverse can cheaply reject the cells that can't contain a query point.
+  const cellLonMin: number[][] = [];
+  const cellLonMax: number[][] = [];
+  const cellLatMin: number[][] = [];
+  const cellLatMax: number[][] = [];
+  for (let r = 0; r < R - 1; r++) {
+    cellLonMin[r] = new Array(C - 1);
+    cellLonMax[r] = new Array(C - 1);
+    cellLatMin[r] = new Array(C - 1);
+    cellLatMax[r] = new Array(C - 1);
+    for (let c = 0; c < C - 1; c++) {
+      const lo0 = lon[r][c], lo1 = lon[r][c + 1], lo2 = lon[r + 1][c], lo3 = lon[r + 1][c + 1];
+      const la0 = lat[r][c], la1 = lat[r][c + 1], la2 = lat[r + 1][c], la3 = lat[r + 1][c + 1];
+      cellLonMin[r][c] = Math.min(lo0, lo1, lo2, lo3);
+      cellLonMax[r][c] = Math.max(lo0, lo1, lo2, lo3);
+      cellLatMin[r][c] = Math.min(la0, la1, la2, la3);
+      cellLatMax[r][c] = Math.max(la0, la1, la2, la3);
+    }
+  }
+
+  return {
+    cols, rows, lon, lat,
+    width: cols[C - 1], height: rows[R - 1],
+    cellLonMin, cellLonMax, cellLatMin, cellLatMax,
+  };
 }
 
 /**
@@ -122,24 +159,41 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
   const R = grid.rows.length;
   const C = grid.cols.length;
   let best: { r: number; c: number; u: number; t: number; err: number } | null = null;
+
+  // Fast path: only Newton-solve cells whose precomputed lon/lat bbox contains
+  // the target (typically 1, a few near warped cell edges). A tiny epsilon pads
+  // the bbox so points exactly on a shared edge aren't missed by both cells.
+  const EPS = 1e-7;
   for (let r = 0; r < R - 1; r++) {
     for (let c = 0; c < C - 1; c++) {
+      if (
+        lon < grid.cellLonMin[r][c] - EPS || lon > grid.cellLonMax[r][c] + EPS ||
+        lat < grid.cellLatMin[r][c] - EPS || lat > grid.cellLatMax[r][c] + EPS
+      ) {
+        continue; // bbox can't contain the point
+      }
       const sol = solveCell(grid, r, c, lon, lat);
       if (!sol) continue;
-      // prefer a solution with (u,t) inside [0,1]; otherwise track nearest.
       const inside = sol.u >= -1e-6 && sol.u <= 1 + 1e-6 && sol.t >= -1e-6 && sol.t <= 1 + 1e-6;
       if (inside) return cellToPixel(grid, r, c, sol.u, sol.t);
       if (best === null || sol.err < best.err) best = { r, c, ...sol };
     }
   }
+  if (best !== null) {
+    return cellToPixel(grid, best.r, best.c, clamp01(best.u), clamp01(best.t));
+  }
+
+  // Fallback: the point is outside every cell bbox (off-swath query). Find the
+  // nearest cell solution by scanning all cells, rare, so the full cost is OK.
+  for (let r = 0; r < R - 1; r++) {
+    for (let c = 0; c < C - 1; c++) {
+      const sol = solveCell(grid, r, c, lon, lat);
+      if (!sol) continue;
+      if (best === null || sol.err < best.err) best = { r, c, ...sol };
+    }
+  }
   if (best === null) return [NaN, NaN];
-  return cellToPixel(
-    grid,
-    best.r,
-    best.c,
-    clamp01(best.u),
-    clamp01(best.t)
-  );
+  return cellToPixel(grid, best.r, best.c, clamp01(best.u), clamp01(best.t));
 }
 
 // --- internals ---

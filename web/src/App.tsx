@@ -1,10 +1,9 @@
-import { MosaicLayer, MultiCOGLayer } from "@developmentseed/deck.gl-geotiff";
-import { epsgResolver } from "@developmentseed/proj";
+import { MosaicLayer } from "@developmentseed/deck.gl-geotiff";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Device } from "@luma.gl/core";
 import "maplibre-gl/dist/maplibre-gl.css";
 import * as RadixSlider from "@radix-ui/react-slider";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
@@ -18,6 +17,7 @@ import {
 import { resultToBbox, type GeoResult } from "./geocode";
 import { loadLookPrefs, saveLookPrefs } from "./prefs";
 import { PlaceSearch } from "./PlaceSearch";
+import { GcpMultiCOGLayer } from "./GcpMultiCOGLayer";
 import {
   AMP_COMPOSITE,
   buildRenderPipeline,
@@ -31,12 +31,14 @@ import {
 } from "./renderPipeline";
 
 // Aconcagua / central Andes: steep relief, the canonical dramatic-SAR demo.
-// Kept tight on purpose — MPC blob throttles bursts, so fewer scenes in view =
-// more tiles actually land.
+// Tight AOI so the first warp renders one well-understood GRD scene.
 const DEFAULT_BBOX: [number, number, number, number] = [-70.3, -32.9, -69.8, -32.5];
-// A short window with verified VV/VH IW coverage over the AOI (see RESEARCH.md).
-const DEFAULT_DATE_FROM = "2024-01-01";
-const DEFAULT_DATE_TO = "2024-03-01";
+// ~1-week window ending on the verified Andes VV/VH IW GRD scene (2026-06-05;
+// see docs/PLAN.md, S1A_IW_GRDH_1SDV_20260605T232821...). A week (not a single
+// day) so FETCH VIEW finds an overpass after you pan elsewhere; the load stays
+// bounded by maxItems regardless of how many scenes the window contains.
+const DEFAULT_DATE_FROM = "2026-05-30";
+const DEFAULT_DATE_TO = "2026-06-05";
 // Ceiling for the "fetch viewport" AOI span (deg/axis) so a zoomed-out view
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
@@ -71,7 +73,7 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null);
   // Cache MultiCOGLayer `sources` records per (pol, source.id) so the SAME
   // object reference is reused across look changes. MultiCOGLayer resets on
-  // `props.sources !== oldProps.sources`, reopening GeoTIFFs and refetching —
+  // `props.sources !== oldProps.sources`, reopening GeoTIFFs and refetching ,
   // a fresh object each render would refetch on every slider tick.
   const sourcesCache = useRef(new Map<string, Record<string, { url: string }>>());
   const polGen = useRef(0);
@@ -79,10 +81,16 @@ export default function App() {
   // One AbortController per generation; aborting on pol switch kills the old
   // pol's in-flight band fetches so they don't starve the new pol's requests.
   const genAbort = useRef<AbortController | null>(null);
+  // Aborts the in-flight STAC search when a new manual fetch supersedes it.
+  const fetchAbort = useRef<AbortController | null>(null);
 
   const [labelBeforeId, setLabelBeforeId] = useState<string | undefined>(undefined);
   const [stacItems, setStacItems] = useState<PartialSTACItem[]>([]);
   const [stacError, setStacError] = useState<string | null>(null);
+  // Fetching is MANUAL: nothing loads until the user hits FETCH VIEW or draws an
+  // AOI. `hasFetched` distinguishes the idle first-run state from an empty result.
+  const [fetching, setFetching] = useState(false);
+  const [hasFetched, setHasFetched] = useState(false);
 
   const initialPrefs = useRef(loadLookPrefs()).current;
   const [pol, setPol] = useState<Polarization>(initialPrefs.pol);
@@ -163,46 +171,62 @@ export default function App() {
   const gen = polGen.current;
   const genSignal = genAbort.current.signal;
 
-  // Fresh scoreboard whenever the source set (AOI / date) or pol changes.
-  useEffect(() => resetStats(), [bbox, dateFrom, dateTo, pol]);
+  // Fresh scoreboard on pol switch (layers remount and reload under the new pol).
+  useEffect(() => resetStats(), [pol]);
 
-  useEffect(() => {
-    const ac = new AbortController();
-    setStacError(null);
-    // Debounce: rapid bbox/date changes (draw drags, typing) would otherwise
-    // kick off overlapping /search paginations.
-    const t = setTimeout(() => {
-      fetchStacItems({ datetime: datetimeOf(dateFrom, dateTo), bbox, maxItems: 12, signal: ac.signal })
+  // Abort any in-flight search when the component unmounts.
+  useEffect(() => () => fetchAbort.current?.abort(), []);
+
+  /**
+   * The single, explicit STAC fetch. Nothing calls this on load, on geocode, or
+   * on a date edit. Only FETCH VIEW and DRAW AOI invoke it, each passing the AOI
+   * directly so we never race React state. The current date window is read live.
+   */
+  const runFetch = useCallback(
+    (targetBbox: [number, number, number, number]) => {
+      fetchAbort.current?.abort();
+      const ac = new AbortController();
+      fetchAbort.current = ac;
+      setBbox(targetBbox);
+      setStacError(null);
+      setFetching(true);
+      setHasFetched(true);
+      resetStats();
+      fetchStacItems({
+        datetime: datetimeOf(dateFrom, dateTo),
+        bbox: targetBbox,
+        maxItems: 3,
+        signal: ac.signal,
+      })
         .then(({ items, rejected }) => {
+          if (ac.signal.aborted) return;
           setStacItems(items);
-          console.info(`[stac] ${items.length} S1 RTC scenes (${rejected} unusable)`);
+          console.info(`[stac] ${items.length} S1 GRD scenes (${rejected} unusable)`);
           if (items.length === 0) {
-            setStacError("No Sentinel-1 RTC scenes for this area/date. Widen the window or move the AOI.");
+            setStacError("No Sentinel-1 GRD scenes here for this date window. Widen the dates or move the AOI, then fetch again.");
           }
         })
         .catch((err) => {
           if (err.name !== "AbortError") {
-            // Keep whatever scenes are already on screen; just surface the error
-            // (MPC throttles — a transient 504 shouldn't blank the map).
             console.error("[stac] fetch failed:", err);
             setStacError(String(err.message ?? err));
           }
+        })
+        .finally(() => {
+          if (fetchAbort.current === ac) setFetching(false);
         });
-    }, 400);
-    return () => {
-      clearTimeout(t);
-      ac.abort();
-    };
-  }, [dateFrom, dateTo, bbox]);
+    },
+    [dateFrom, dateTo],
+  );
 
   const handleDrawBox = (bb: [number, number, number, number]) => {
-    setBbox(bb);
     setMarker(null);
     setDrawing(false);
+    runFetch(bb); // drawing an AOI is an explicit "load scenes here"
   };
 
-  // "Fetch viewport": set the STAC AOI to the current view + small buffer,
-  // clamped so a zoomed-out view can't fan out into hundreds of COG opens.
+  // FETCH VIEW: build an AOI from the current view + small buffer, clamped so a
+  // zoomed-out view can't fan out into hundreds of COG opens, then fetch it.
   const handleFetchViewport = () => {
     const map = mapRef.current?.getMap();
     if (!map) return;
@@ -221,16 +245,17 @@ export default function App() {
     const halfW = Math.min((e - w) / 2, maxHalf);
     const halfH = Math.min((n - s) / 2, maxHalf);
     setMarker(null);
-    setBbox([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
+    runFetch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
   };
 
   const handleResetNorth = () => {
     mapRef.current?.getMap()?.easeTo({ bearing: 0, pitch: 0, duration: 400 });
   };
 
+  // Geocode just MOVES the map (and drops a marker). It does NOT fetch — the
+  // user hits FETCH VIEW when they're framed on what they want.
   const handlePickPlace = (r: GeoResult) => {
     const bb = resultToBbox(r);
-    setBbox(bb);
     setMarker({ lng: r.center[0], lat: r.center[1], label: r.label });
     setShowMarker(false);
     mapRef.current?.fitBounds(
@@ -273,16 +298,21 @@ export default function App() {
           sources = { amp: { url: href } };
           sourcesCache.current.set(cacheKey, sources);
         }
-        return new MultiCOGLayer({
+        return new GcpMultiCOGLayer({
           id: `s1-multi-${pol}-${gen}-${source.id}`,
           sources,
           composite: AMP_COMPOSITE,
           renderPipeline: pipeline,
-          epsgResolver,
           signal: genSignal,
           refinementStrategy: "best-available",
-          // MPC blob storage throttles on bursts; keep concurrency modest.
-          maxRequests: 6,
+          // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
+          // reprojection mesh looks identical to a fine one but builds far fewer
+          // triangles and calls the (heavier) GCP inverse far fewer times.
+          // Default 0.125 px is overkill here and stutters; 0.75 px is plenty.
+          maxError: 0.75,
+          // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
+          // concurrency so a wide view doesn't stampede range reads.
+          maxRequests: 10,
           onGeoTIFFLoad: () => reportLoaded(href),
           onError: (e: unknown) =>
             reportFailed(href, e instanceof Error ? e.message : String(e)),
@@ -352,6 +382,8 @@ export default function App() {
         sceneCount={polItems.length}
         totalCount={stacItems.length}
         error={stacError}
+        fetching={fetching}
+        hasFetched={hasFetched}
         stats={stats}
         pol={pol}
         onPolChange={setPol}
@@ -571,6 +603,8 @@ function InfoPanel({
   sceneCount,
   totalCount,
   error,
+  fetching,
+  hasFetched,
   stats,
   pol,
   onPolChange,
@@ -599,6 +633,8 @@ function InfoPanel({
   sceneCount: number;
   totalCount: number;
   error: string | null;
+  fetching: boolean;
+  hasFetched: boolean;
   stats: LoadStats;
   pol: Polarization;
   onPolChange: (p: Polarization) => void;
@@ -747,9 +783,11 @@ function InfoPanel({
         >
           {error
             ? `STAC: ${error}`
-            : totalCount === 0
-              ? "loading STAC scenes…"
-              : `${sceneCount} ${pol.toUpperCase()} scenes · ${stats.loaded} loaded · ${stats.failed} failed · ${pending} pending`}
+            : fetching
+              ? "fetching scenes…"
+              : !hasFetched
+                ? "Hit FETCH VIEW or draw an AOI to load Sentinel-1 scenes."
+                : `${sceneCount} ${pol.toUpperCase()} scenes · ${stats.loaded} loaded · ${stats.failed} failed · ${pending} pending`}
         </div>
         {totalCount > sceneCount && !error && (
           <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 3 }}>
@@ -959,15 +997,15 @@ function InfoPanel({
         <div style={{ color: UI.faint, marginTop: 4 }}>
           Data:{" "}
           <a
-            href="https://planetarycomputer.microsoft.com/dataset/sentinel-1-rtc"
+            href="https://registry.opendata.aws/sentinel-1/"
             target="_blank"
             rel="noreferrer"
-            title="Sentinel-1 RTC on the Microsoft Planetary Computer"
+            title="Raw Sentinel-1 GRD via Element 84 Earth Search (AWS Open Data)"
             style={{ color: UI.accent, textDecoration: "none" }}
           >
-            Sentinel-1 RTC
+            Sentinel-1 GRD
           </a>{" "}
-          via Microsoft Planetary Computer
+          via Earth Search (AWS Open Data), GCP-warped in the browser
         </div>
         <div style={{ color: UI.faint, marginTop: 4 }}>
           Built with{" "}
