@@ -1,13 +1,67 @@
 # Plan — Sentinel-1 Amplitude Explorer
 
-> **NEXT AGENT: START HERE.** This is the committed direction as of 2026-06-09.
-> **Start by cutting a new branch off `main`** (e.g. `gcp-warp`) — this work lands
-> there, not on `main`. Read this whole file, then `docs/RESEARCH.md` and
-> `.claude/memory/MEMORY.md`.
+> **NEXT AGENT: START HERE.** Committed direction as of 2026-06-09.
+> Read this whole file, then `docs/RESEARCH.md` and `.claude/memory/MEMORY.md`.
 > The headline: we are building a **client-side GCP warp of raw Sentinel-1 GRD
 > amplitude**, read straight from open object storage. No backend, no DEM, no
 > tile server. This is the no-compromise path Stephen held out for after we
 > burned through every off-the-shelf source.
+
+---
+
+## ⛳ STATUS — session 2 (2026-06-09 PM). READ THIS FIRST.
+
+**THE DELIVERABLE IS A RUNNABLE BROWSER APP STEPHEN OPENS HIMSELF.** Not
+screenshots, not offline renders, not `/tmp` scripts. The single success
+criterion: `cd web && npm run dev`, open the URL, see the warped S1 amplitude
+image, pan/zoom it. **Do NOT generate images for him with GDAL/Python/etc.** A
+prior turn did an offline GDAL render to sanity-check the look (it worked: dark
+specular ocean, bright textured Andes relief, coastline correct) — that was a
+detour Stephen explicitly rejected. The look is proven; stop proving it. Build
+the tool.
+
+**Branch:** `gcp-warp` (cut off `main`; rename of the briefly-named
+`gcp-warp-zarr`). Work lands here, not `main`.
+
+**Done this session (work items A + B — in the working tree, NOT yet committed;
+a commit was attempted and interrupted, so `git add`+commit them first):**
+- `web/src/gcp.ts` — `parseGcps(modelTiepoint)` reads ALL 210 GCPs from the flat
+  ModelTiepoint array; `buildGcpGrid` makes the 21×10 rectilinear lattice;
+  `forward(grid,px,py)→[lon,lat]` (bilinear, exact at nodes) and
+  `inverse(grid,lon,lat)→[px,py]` (per-cell Newton). Pure, no deck.gl dep.
+- `web/test/gcp.test.mjs` + `web/test/fixtures/andes-vv-gcps.json` (210-pt
+  gdalinfo dump). `node web/test/gcp.test.mjs` → **8/8 pass**: forward
+  reproduces every GCP node to <1e-9°, inverse round-trips <1px.
+- These are the geolocation core that work item C consumes. **They are correct
+  and validated — reuse them, do not rebuild.**
+
+**Zarr track is DEAD (confirmed, do not reopen without a proxy):** `objects.eodc.eu`
+sends NO CORS on any bucket and 403s preflights → browser-blocked, exact DE
+Africa wall. STAC API is CORS-open but points data back at the no-CORS store;
+EOPF explorer only renders via server-side TiTiler. Full detail in MEMORY.md.
+Stephen's call: build the COG GCP-warp. (Zarr only made item A easier anyway.)
+
+**Verified live data target (use this exact scene to first render):**
+- Earth Search POST `https://earth-search.aws.element84.com/v1/search`,
+  collection `sentinel-1-grd`, `query:{sar:instrument_mode:{eq:"IW"}}`.
+- Andes VV COG (s3→https rewrite to
+  `https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/<key>`):
+  `GRD/2026/6/5/IW/DV/S1A_IW_GRDH_1SDV_20260605T232821_20260605T232846_064840_082B9D_B7BE/measurement/iw-vv.tiff`
+- **CORS-open** (anonymous 206, `ACAO:*`, `image/tiff`). 26117×16884, **UInt16
+  amplitude**, nodata 0, **6 overviews**, **NO affine**, 210 GCPs in
+  ModelTiepoint tag 33922 (1260 doubles, no `_GDAL_GCPs` variant). dB stretch
+  that looked right offline: `20*log10(DN/65535)`, ~−65→−45 dB, mild gamma.
+
+**Remaining = work items C then D below.** C is the hard part (the deck.gl-raster
+non-affine tileset the lib flagged as "future"). If C proves deep/uncertain,
+the pragmatic fallback that still ships a real in-repo browser tool: do the warp
+client-side with `gcp.ts` (read a COG overview via `@developmentseed/geotiff`,
+warp into a canvas with `inverse()`, apply dB) and drape it as a deck.gl
+`BitmapLayer` over its 3857 bounds. Less elegant than the mesh tileset, but it
+renders in the actual app and reuses A+B. Pick whichever gets a runnable viz
+soonest — that is what Stephen wants.
+
+---
 
 ## The decision (why this and not a quick swap)
 
@@ -68,6 +122,10 @@ stream from overviews as usual. One extra small read per scene for the GCPs.
 
 ## Net-new work (sequenced; de-risk cheap first)
 
+**✅ A — DONE (session 2).** **✅ B — DONE (session 2).** See STATUS block above:
+both shipped in `web/src/gcp.ts`, validated 8/8 against gdalinfo. The text below
+is the original spec, kept for context. **Start at C.**
+
 **A. Read all GCPs from the GeoTIFF.** `@developmentseed/geotiff` fetches the
 ModelTiePoint tag but `transform.ts` uses only the first point (`[3],[4]`). The
 other 209 tiepoints are in the same tag (6 doubles each: i,j,k,x,y,z), plus the
@@ -125,10 +183,9 @@ it; Stephen leans toward the real thing.
 
 - **Primary:** raw GRD COGs, Earth Search `sentinel-1-grd` → `sentinel-s1-l1c`
   bucket (CORS-verified). uint16 amplitude, 210-pt GCP grid, overviews.
-- **Alternate (equally valid):** EOPF S1 GRD Zarr on `objects.eodc.eu` — GCP grid
-  is a native `conditions/gcp` array (cleaner to read than COG tags). **Confirm
-  CORS on `objects.eodc.eu` before relying on it.** Read via `@developmentseed/
-  deck.gl-zarr` + `zarrita`.
+- **Alternate: DEAD (session 2).** EOPF S1 GRD Zarr on `objects.eodc.eu` is
+  browser-blocked (no CORS on any bucket, preflight 403). Confirmed, not viable
+  client-side without a proxy. See STATUS block + MEMORY.md. Do not reopen.
 
 ## Risks / unknowns
 

@@ -40,8 +40,17 @@ A→B→C→D) are in `docs/PLAN.md`.
 - MPC `sentinel-1-rtc`: renders (UTM affine) but SAS + throttles to 504 (Stephen
   vetoed MS; it proved his point). We DID wire it — current tree is on this.
 - DE Africa `s1_rtc`: perfect projected data, but bucket has no CORS (STAC does).
-- EOPF S1 GRD Zarr (`objects.eodc.eu`): also ground-range/GCP (has `conditions/gcp`
-  as a native array — good for our warp; CORS unconfirmed). Valid ALTERNATE source.
+- EOPF S1 GRD Zarr (`objects.eodc.eu`): also ground-range/GCP (native `conditions/gcp`
+  array). **CONFIRMED NO CORS (2026-06-09)** on objects.eodc.eu — every bucket
+  (`notebook-data`, `202606-s01siwgrh-global`): 200 GET carries NO `access-control-
+  allow-origin`, OPTIONS preflight 403s. Browser-blocked = DE Africa wall. The STAC
+  API (`stac.core.eopf.eodc.eu`, collection `sentinel-1-l1-grd`) IS CORS-open but its
+  asset hrefs point back at no-CORS objects.eodc.eu. EOPF explorer renders via
+  server-side TiTiler, not client-side chunk streaming, so there is NO no-backend
+  Zarr route. Store is Zarr v2 w/ consolidated `.zmetadata` (one fetch = all meta);
+  measurements at `<scene>/measurements`, GCPs at `conditions/gcp` (lat/long vars).
+  Coverage now `...-global...` (cpm_v270), broader than old samples. Stephen's call
+  2026-06-09: drop Zarr, build COG GCP-warp. Reopen only if a CORS proxy/EODC fix lands.
 
 ## Current code state (mid-detour, reconcile per PLAN.md)
 - `stac.ts` → MPC RTC + container SAS token + retry/backoff. Repoint to raw GRD
