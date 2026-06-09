@@ -197,7 +197,6 @@ export default function App() {
       setStacError(null);
       setFetching(true);
       setHasFetched(true);
-      setFetchGen((g) => g + 1);
       resetStats();
       fetchStacItems({
         datetime: datetimeOf(dateFrom, dateTo),
@@ -207,7 +206,12 @@ export default function App() {
       })
         .then(({ items, rejected }) => {
           if (ac.signal.aborted) return;
+          // Bump fetchGen TOGETHER with the new scenes (batched into one render)
+          // so the MosaicLayer id changes exactly when the data does. Bumping it
+          // earlier remounts with the OLD scenes, then keeps that id when the new
+          // ones arrive -> the inner TileLayer never re-traverses (stale tiles).
           setStacItems(items);
+          setFetchGen((g) => g + 1);
           console.info(`[stac] ${items.length} S1 GRD scenes (${rejected} unusable)`);
           if (items.length === 0) {
             setStacError("No Sentinel-1 GRD scenes here for this date window. Widen the dates or move the AOI, then fetch again.");
