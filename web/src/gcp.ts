@@ -179,12 +179,16 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
       if (best === null || sol.err < best.err) best = { r, c, ...sol };
     }
   }
+  // No cell strictly contained the point. Return the nearest cell's solution
+  // UNCLAMPED so it linearly extrapolates past the grid edge, the exact inverse
+  // of `forward`'s edge extrapolation. Clamping here would refold the boundless
+  // padding region and reintroduce the non-convergence `forward` just fixed.
   if (best !== null) {
-    return cellToPixel(grid, best.r, best.c, clamp01(best.u), clamp01(best.t));
+    return cellToPixel(grid, best.r, best.c, best.u, best.t);
   }
 
-  // Fallback: the point is outside every cell bbox (off-swath query). Find the
-  // nearest cell solution by scanning all cells, rare, so the full cost is OK.
+  // Fallback: the point was outside every cell bbox (off-swath query). Scan all
+  // cells for the nearest solution; rare, so the full cost is OK.
   for (let r = 0; r < R - 1; r++) {
     for (let c = 0; c < C - 1; c++) {
       const sol = solveCell(grid, r, c, lon, lat);
@@ -193,7 +197,7 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
     }
   }
   if (best === null) return [NaN, NaN];
-  return cellToPixel(grid, best.r, best.c, clamp01(best.u), clamp01(best.t));
+  return cellToPixel(grid, best.r, best.c, best.u, best.t);
 }
 
 // --- internals ---
@@ -204,12 +208,25 @@ function uniqueSorted(values: number[]): number[] {
 
 /**
  * Locate `x` in an ascending coordinate array. Returns the lower cell index
- * `c0` and the local fraction `t` in [0,1] toward `c0+1`. Clamps outside range.
+ * `c0` (always in [0, last-1]) and the local fraction `t` toward `c0+1`.
+ *
+ * Past the ends, `t` EXTRAPOLATES (t<0 below coords[0], t>1 above coords[last])
+ * using the first/last cell's spacing, instead of clamping. This keeps `forward`
+ * linear and continuous past the grid edge, matching an affine geotransform. It
+ * matters because COG tiles are boundless (padded past the image edge): clamping
+ * would fold every out-of-grid pixel onto the edge, a discontinuity the
+ * reprojection mesh can never resolve (it spins to its iteration cap).
  */
 function locate(coords: number[], x: number): { c0: number; t: number } {
   const last = coords.length - 1;
-  if (x <= coords[0]) return { c0: 0, t: 0 };
-  if (x >= coords[last]) return { c0: last - 1, t: 1 };
+  if (x <= coords[0]) {
+    const span = coords[1] - coords[0];
+    return { c0: 0, t: span === 0 ? 0 : (x - coords[0]) / span };
+  }
+  if (x >= coords[last]) {
+    const span = coords[last] - coords[last - 1];
+    return { c0: last - 1, t: span === 0 ? 0 : (x - coords[last - 1]) / span };
+  }
   // binary search for the cell [c0, c0+1] containing x
   let lo = 0;
   let hi = last;
@@ -234,10 +251,6 @@ function bilerp(
   const top = grid[r0][c0] * (1 - t) + grid[r0][c1] * t;
   const bot = grid[r1][c0] * (1 - t) + grid[r1][c1] * t;
   return top * (1 - u) + bot * u;
-}
-
-function clamp01(x: number): number {
-  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 /** Convert a cell-local (u along row, t along col) back to absolute pixel/line. */
