@@ -46,13 +46,11 @@ const DEFAULT_DATE_TO = "2026-06-05";
 // Ceiling for the "fetch viewport" AOI span (deg/axis) so a zoomed-out view
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
-// Sentinel-1 era: 1A launched 2014-04-03, no GRD before it; cap the future at
-// today. Bounds the date pickers so the year stays a sane 20xx.
-const S1_MIN_DATE = "2014-04-03";
-const TODAY = new Date().toISOString().slice(0, 10);
 
 function datetimeOf(from: string, to: string): string {
-  return `${from}T00:00:00Z/${to}T23:59:59Z`;
+  // Tolerate a reversed range (the segmented date fields don't link min/max).
+  const [a, b] = from <= to ? [from, to] : [to, from];
+  return `${a}T00:00:00Z/${b}T23:59:59Z`;
 }
 
 /**
@@ -615,11 +613,120 @@ const selectStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
-const dateInputStyle: React.CSSProperties = {
-  ...selectStyle,
-  flex: 1,
-  colorScheme: "dark",
-};
+/**
+ * Segmented date field: MM / DD / 20[YY]. The century is fixed at "20" (all of
+ * Sentinel-1's archive is 20xx) and you type only the two-digit year. Commits a
+ * clamped YYYY-MM-DD on blur / Enter. No hard era bounds (overridable); the
+ * search swaps a reversed range, so from/to don't need linked min/max.
+ */
+function DateField({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  ariaLabel?: string;
+}) {
+  const parse = (v: string) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+    return m ? { mm: m[2], dd: m[3], yy: m[1].slice(2) } : { mm: "", dd: "", yy: "" };
+  };
+  const [seg, setSeg] = useState(parse(value));
+  const lastValue = useRef(value);
+  useEffect(() => {
+    if (value !== lastValue.current) {
+      setSeg(parse(value));
+      lastValue.current = value;
+    }
+  }, [value]);
+
+  const digits = (v: string, n: number) => v.replace(/\D/g, "").slice(0, n);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const clampInt = (s: string, lo: number, hi: number, fb: number) => {
+    const n = parseInt(s, 10);
+    return Number.isNaN(n) ? fb : Math.max(lo, Math.min(hi, n));
+  };
+
+  const commit = (next: { mm: string; dd: string; yy: string }) => {
+    const m = clampInt(next.mm, 1, 12, 1);
+    const yNum = 2000 + clampInt(next.yy, 0, 99, new Date().getFullYear() - 2000);
+    const dMax = new Date(yNum, m, 0).getDate(); // last day of month m
+    const d = clampInt(next.dd, 1, dMax, 1);
+    const iso = `${yNum}-${pad(m)}-${pad(d)}`;
+    setSeg({ mm: pad(m), dd: pad(d), yy: pad(yNum % 100) });
+    if (iso !== lastValue.current) {
+      lastValue.current = iso;
+      onChange(iso);
+    }
+  };
+
+  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+  };
+  const segInput: React.CSSProperties = {
+    ...selectStyle,
+    width: 26,
+    padding: "5px 0",
+    textAlign: "center",
+    cursor: "text",
+  };
+  const sep = { color: UI.faint, fontFamily: UI.mono, fontSize: 12 } as const;
+
+  return (
+    <div
+      aria-label={ariaLabel}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 3,
+        flex: 1,
+        padding: "0 6px",
+        background: UI.field,
+        border: `1px solid ${UI.fieldBorder}`,
+        borderRadius: 4,
+        justifyContent: "center",
+      }}
+    >
+      <input
+        value={seg.mm}
+        onChange={(e) => setSeg((s) => ({ ...s, mm: digits(e.target.value, 2) }))}
+        onBlur={() => commit(seg)}
+        onKeyDown={onKey}
+        onFocus={(e) => e.target.select()}
+        inputMode="numeric"
+        placeholder="MM"
+        aria-label="month"
+        style={segInput}
+      />
+      <span style={sep}>/</span>
+      <input
+        value={seg.dd}
+        onChange={(e) => setSeg((s) => ({ ...s, dd: digits(e.target.value, 2) }))}
+        onBlur={() => commit(seg)}
+        onKeyDown={onKey}
+        onFocus={(e) => e.target.select()}
+        inputMode="numeric"
+        placeholder="DD"
+        aria-label="day"
+        style={segInput}
+      />
+      <span style={sep}>/</span>
+      <span style={{ ...sep, color: UI.mute }}>20</span>
+      <input
+        value={seg.yy}
+        onChange={(e) => setSeg((s) => ({ ...s, yy: digits(e.target.value, 2) }))}
+        onBlur={() => commit(seg)}
+        onKeyDown={onKey}
+        onFocus={(e) => e.target.select()}
+        inputMode="numeric"
+        placeholder="YY"
+        aria-label="year"
+        style={segInput}
+      />
+    </div>
+  );
+}
 
 function StepButton({
   onClick,
@@ -936,24 +1043,10 @@ function InfoPanel({
       {/* Search: place, date window, search action, view toggles */}
       <Section label="Search" first>
         <PlaceSearch ref={searchRef} onPick={onPickPlace} />
-        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="date"
-            value={dateFrom}
-            min={S1_MIN_DATE}
-            max={dateTo}
-            onChange={(e) => onDateFromChange(e.target.value)}
-            style={dateInputStyle}
-          />
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+          <DateField value={dateFrom} onChange={onDateFromChange} ariaLabel="start date" />
           <span style={{ color: UI.faint }}>→</span>
-          <input
-            type="date"
-            value={dateTo}
-            min={dateFrom}
-            max={TODAY}
-            onChange={(e) => onDateToChange(e.target.value)}
-            style={dateInputStyle}
-          />
+          <DateField value={dateTo} onChange={onDateToChange} ariaLabel="end date" />
         </div>
         <div style={{ marginTop: 9, display: "flex", gap: 6 }}>
           <Toggle active={searching} onClick={onSearchViewport} grow
