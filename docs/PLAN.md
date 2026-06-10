@@ -60,6 +60,55 @@ nodata 0, 6 overviews, NO affine, 210 GCPs in ModelTiepoint tag 33922.
 
 ---
 
+## ⚑ SESSION 3 FEEDBACK & ROADMAP (Stephen, 2026-06-09/10) — DO NEXT
+
+Notes captured verbatim from Stephen; no code written for these yet.
+
+1. **STILL SLUGGISH ON ZOOM-OUT (open bug, highest priority).** "still struggling
+   with zoom out gets slow sluggish non responsive." The affine ghost-ring fix
+   (commit `5834346`) killed the 10001-iteration non-convergence, and the
+   bump-fetchGen-with-data fix (`03fa265`) made every fetch render, BUT zooming
+   OUT is still slow/janky. Leads to investigate next session:
+   - At zoom-out the coarsest overview is a single tile covering the whole scene;
+     with up to 3 overlapping scenes that is 3 full-scene reprojection meshes +
+     textures rebuilt on the main thread. Suspect mesh vertex count and/or the
+     GCP `inverse` (per-vertex, full-scan fallback for ghost/padding points) is
+     still heavy at that level.
+   - Cheap levers to try: cap min zoom / drop the most-padding coarse overview
+     levels in `buildGcpDescriptor`; raise `maxError` further for coarse levels;
+     reduce overlapping scenes drawn at once; profile `inverse` call counts.
+   - Stephen's framing throughout: "we should not be pulling these massive images
+     into the browser." Reassure/verify COG range-reads (not whole-file) AND make
+     zoom-out cheap. A hard max-zoom / resolution cap is on the table.
+
+2. **SAVE SETTINGS (feature request).** "add save settings." Current state:
+   `prefs.ts` already persists LOOK only (pol, dbRange, gamma; key `s1amp.lookPrefs.v3`)
+   to localStorage. Stephen wants broader saved settings — at minimum confirm what
+   he means: likely persist AOI / date window / view (navigational state, which
+   prefs.ts deliberately does NOT save today), and/or an explicit Save/Reset UI.
+   Decide scope with him before building.
+
+3. **STAC-MAP COMPONENTS / SEARCH VIEW (to discuss, then build).** "we're going to
+   discuss including stac-map components like search view." Pull in Development
+   Seed `stac-map` / STAC browser components for a real search UI (footprints,
+   item list, date stepping) instead of the current bare FETCH-VIEW / DRAW-AOI.
+   This is a discussion item first — agree on which components and how they wire to
+   the existing `stac.ts` (Earth Search `sentinel-1-grd`) before coding.
+
+4. **COVERAGE-FIRST "MOST COMPLETE MOSAIC" SELECTION (feature gap).** "the
+   mapterhorn allowed me to search for a most complete mosaic within the date range
+   which this isnt doing." The sibling `deckgl-raster-mapterhorn-s2` (and the
+   inherited `web/src/earthSearchStac.ts.ref` here) has `selectCoverageFirst()`:
+   given candidate scenes over an AOI + date window, it picks the set that best
+   COVERS the AOI (coverage-first, then cloud/recency fill), ordered for the mosaic
+   stack. This app currently just takes the most recent N (maxItems 3) scenes — no
+   coverage logic. Port the coverage-first selection so a date-range search returns
+   the most complete mosaic, not just the latest few. `earthSearchStac.ts.ref` is
+   the reference implementation (it is S2/cloud-oriented; adapt for S1 GRD: drop
+   cloud, group by relative orbit / footprint, fill AOI coverage).
+
+---
+
 ## The decision (why this and not a quick swap)
 
 Stephen's non-negotiables: **raw amplitude, from open object storage / a tolerant
