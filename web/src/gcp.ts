@@ -73,7 +73,27 @@ export interface GcpGrid {
   cellLonMax: number[][];
   cellLatMin: number[][];
   cellLatMax: number[][];
+  /**
+   * Least-squares affine fit of the whole grid's inverse map
+   * `[lon,lat] -> [pixel,line]`, as `[a,b,c, d,e,f]` where
+   * `pixel = a*lon + b*lat + c` and `line = d*lon + e*lat + f`. Used by
+   * {@link inverse} for points that fall beyond even the padded ghost ring
+   * (boundless coarse tiles map far past the grid): an O(1) estimate there
+   * instead of a full per-cell Newton scan, which was the zoom-out bottleneck.
+   * `null` if the fit is degenerate (tiny/collinear grid), in which case
+   * `inverse` keeps its exact per-cell scan.
+   */
+  invAffine: [number, number, number, number, number, number] | null;
 }
+
+/**
+ * Diagnostic counters for {@link inverse}'s code paths, so a zoom-out can be
+ * profiled from the browser console (`globalThis.gcpInverseStats`) to confirm
+ * which path dominates. Cheap to maintain; safe to leave in.
+ */
+export const gcpInverseStats = { fast: 0, edge: 0, affine: 0, scan: 0 };
+(globalThis as { gcpInverseStats?: typeof gcpInverseStats }).gcpInverseStats =
+  gcpInverseStats;
 
 /**
  * Build a rectilinear grid from a flat GCP list. Validates that the points
@@ -142,7 +162,62 @@ function finalizeGrid(
     cols, rows, lon, lat,
     width: cols[C - 1], height: rows[R - 1],
     cellLonMin, cellLonMax, cellLatMin, cellLatMax,
+    invAffine: fitInverseAffine(cols, rows, lon, lat),
   };
+}
+
+/**
+ * Least-squares fit of the affine inverse map `[lon,lat] -> [pixel,line]` over
+ * all grid nodes. Two independent linear regressions (pixel and line each on
+ * `[lon, lat, 1]`) sharing the same 3x3 normal-equation matrix. Returns
+ * `[a,b,c, d,e,f]`, or `null` if the normal matrix is singular.
+ */
+function fitInverseAffine(
+  cols: number[],
+  rows: number[],
+  lon: number[][],
+  lat: number[][],
+): [number, number, number, number, number, number] | null {
+  const R = rows.length;
+  const C = cols.length;
+  // Normal-equation accumulators for design columns [lon, lat, 1].
+  let sxx = 0, sxy = 0, sx = 0, syy = 0, sy = 0, n = 0;
+  let bpx = 0, bpy = 0, bp1 = 0; // pixel target dotted with [lon, lat, 1]
+  let blx = 0, bly = 0, bl1 = 0; // line  target dotted with [lon, lat, 1]
+  for (let r = 0; r < R; r++) {
+    for (let c = 0; c < C; c++) {
+      const x = lon[r][c];
+      const y = lat[r][c];
+      const px = cols[c];
+      const ln = rows[r];
+      sxx += x * x; sxy += x * y; sx += x; syy += y * y; sy += y; n += 1;
+      bpx += x * px; bpy += y * px; bp1 += px;
+      blx += x * ln; bly += y * ln; bl1 += ln;
+    }
+  }
+  // Symmetric normal matrix M = [[sxx,sxy,sx],[sxy,syy,sy],[sx,sy,n]].
+  const m00 = sxx, m01 = sxy, m02 = sx;
+  const m11 = syy, m12 = sy;
+  const m22 = n;
+  const det =
+    m00 * (m11 * m22 - m12 * m12) -
+    m01 * (m01 * m22 - m12 * m02) +
+    m02 * (m01 * m12 - m11 * m02);
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return null;
+  // Inverse of the symmetric 3x3.
+  const i00 = (m11 * m22 - m12 * m12) / det;
+  const i01 = (m02 * m12 - m01 * m22) / det;
+  const i02 = (m01 * m12 - m02 * m11) / det;
+  const i11 = (m00 * m22 - m02 * m02) / det;
+  const i12 = (m01 * m02 - m00 * m12) / det;
+  const i22 = (m00 * m11 - m01 * m01) / det;
+  const a = i00 * bpx + i01 * bpy + i02 * bp1;
+  const b = i01 * bpx + i11 * bpy + i12 * bp1;
+  const cc = i02 * bpx + i12 * bpy + i22 * bp1;
+  const d = i00 * blx + i01 * bly + i02 * bl1;
+  const e = i01 * blx + i11 * bly + i12 * bl1;
+  const f = i02 * blx + i12 * bly + i22 * bl1;
+  return [a, b, cc, d, e, f];
 }
 
 /**
@@ -257,9 +332,52 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
   const C = grid.cols.length;
   let best: { r: number; c: number; u: number; t: number; err: number } | null = null;
 
-  // Fast path: only Newton-solve cells whose precomputed lon/lat bbox contains
-  // the target (typically 1, a few near warped cell edges). A tiny epsilon pads
-  // the bbox so points exactly on a shared edge aren't missed by both cells.
+  // Fast jump: the global affine fit lands within ~1 cell of the true cell on a
+  // smooth warp, so Newton-solve only a 3x3 neighborhood around the estimate
+  // instead of bbox-scanning all (R-1)*(C-1) cells. This is the hot path the
+  // reprojection mesh hammers per candidate sample (and the mesh builds
+  // synchronously on the main thread), so the O(cells)->O(9) cut is what keeps a
+  // detail-zoom load from freezing. The full scan below stays as the exact
+  // fallback for neighborhood misses (strong warp curvature) and degenerate grids.
+  if (grid.invAffine) {
+    const [aa, bb, cc, dd, ee, ff] = grid.invAffine;
+    const pxEst = aa * lon + bb * lat + cc;
+    const pyEst = dd * lon + ee * lat + ff;
+    const spanX = grid.cols[C - 1] - grid.cols[0];
+    const spanY = grid.rows[R - 1] - grid.rows[0];
+    // Only treat as off-swath when the estimate is FAR (>1 grid span) past the
+    // grid: that's the boundless coarse-tile padding, where the affine estimate
+    // is plenty (O(1)) and the pixels are discarded. Near the edges the fit can
+    // land a little outside, so don't bail there, solve the neighborhood.
+    if (
+      pxEst < grid.cols[0] - spanX || pxEst > grid.cols[C - 1] + spanX ||
+      pyEst < grid.rows[0] - spanY || pyEst > grid.rows[R - 1] + spanY
+    ) {
+      gcpInverseStats.affine++;
+      return [pxEst, pyEst];
+    }
+    // Newton-solve a 3x3 neighborhood around the affine-estimated cell. `locate`
+    // clamps the index to a valid cell even when the estimate falls just outside
+    // (corners). On a miss, fall through to the exact bbox scan.
+    const cEst = locate(grid.cols, pxEst).c0;
+    const rEst = locate(grid.rows, pyEst).c0;
+    const rHi = Math.min(R - 2, rEst + 1);
+    const cHi = Math.min(C - 2, cEst + 1);
+    for (let r = Math.max(0, rEst - 1); r <= rHi; r++) {
+      for (let c = Math.max(0, cEst - 1); c <= cHi; c++) {
+        const sol = solveCell(grid, r, c, lon, lat);
+        if (!sol) continue;
+        if (sol.u >= -1e-6 && sol.u <= 1 + 1e-6 && sol.t >= -1e-6 && sol.t <= 1 + 1e-6) {
+          gcpInverseStats.fast++;
+          return cellToPixel(grid, r, c, sol.u, sol.t);
+        }
+      }
+    }
+  }
+
+  // Exact path (neighborhood miss or degenerate grid): Newton-solve only cells
+  // whose precomputed lon/lat bbox contains the target. A tiny epsilon pads the
+  // bbox so points exactly on a shared edge aren't missed by both cells.
   const EPS = 1e-7;
   for (let r = 0; r < R - 1; r++) {
     for (let c = 0; c < C - 1; c++) {
@@ -272,7 +390,10 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
       const sol = solveCell(grid, r, c, lon, lat);
       if (!sol) continue;
       const inside = sol.u >= -1e-6 && sol.u <= 1 + 1e-6 && sol.t >= -1e-6 && sol.t <= 1 + 1e-6;
-      if (inside) return cellToPixel(grid, r, c, sol.u, sol.t);
+      if (inside) {
+        gcpInverseStats.fast++;
+        return cellToPixel(grid, r, c, sol.u, sol.t);
+      }
       if (best === null || sol.err < best.err) best = { r, c, ...sol };
     }
   }
@@ -281,11 +402,25 @@ export function inverse(grid: GcpGrid, lon: number, lat: number): [number, numbe
   // of `forward`'s edge extrapolation. Clamping here would refold the boundless
   // padding region and reintroduce the non-convergence `forward` just fixed.
   if (best !== null) {
+    gcpInverseStats.edge++;
     return cellToPixel(grid, best.r, best.c, best.u, best.t);
   }
 
-  // Fallback: the point was outside every cell bbox (off-swath query). Scan all
-  // cells for the nearest solution; rare, so the full cost is OK.
+  // Off-swath: the point is beyond even the padded ghost ring (a coarse,
+  // boundless tile maps far past the grid). The old code Newton-scanned EVERY
+  // cell here, O(cells * iters) per sample, and the reprojection mesh calls
+  // this per candidate vertex, so on zoom-out it dominated the main thread.
+  // The grid's global affine fit is an excellent estimate this far out (and
+  // these pixels are off-image: discarded as nodata by the dB shader, or only
+  // used for tile-range bounds), so use it directly, O(1), no Newton.
+  if (grid.invAffine) {
+    gcpInverseStats.affine++;
+    const [a, b, c, d, e, f] = grid.invAffine;
+    return [a * lon + b * lat + c, d * lon + e * lat + f];
+  }
+
+  // Degenerate grid (no affine fit): keep the exact per-cell scan.
+  gcpInverseStats.scan++;
   for (let r = 0; r < R - 1; r++) {
     for (let c = 0; c < C - 1; c++) {
       const sol = solveCell(grid, r, c, lon, lat);

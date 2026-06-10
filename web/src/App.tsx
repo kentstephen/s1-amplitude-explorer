@@ -1,4 +1,5 @@
 import { MosaicLayer } from "@developmentseed/deck.gl-geotiff";
+import { GeoJsonLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Device } from "@luma.gl/core";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -7,7 +8,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
-import { fetchStacItems, type PartialSTACItem, type Polarization } from "./stac";
+import { type PartialSTACItem, type Polarization } from "./stac";
+import { useSceneSearch, type SceneSearch } from "./useSceneSearch";
+import { selectCoverageFirst } from "./coverage";
+import { footprintCollection } from "./footprints";
 import {
   reportFailed,
   reportLoaded,
@@ -15,7 +19,7 @@ import {
   subscribeStats,
 } from "./loadStats";
 import { resultToBbox, type GeoResult } from "./geocode";
-import { loadLookPrefs, saveLookPrefs } from "./prefs";
+import { loadSettings, saveSettings, resetSettings, DEFAULT_SETTINGS } from "./prefs";
 import { PlaceSearch } from "./PlaceSearch";
 import { GcpMultiCOGLayer } from "./GcpMultiCOGLayer";
 import {
@@ -42,9 +46,35 @@ const DEFAULT_DATE_TO = "2026-06-05";
 // Ceiling for the "fetch viewport" AOI span (deg/axis) so a zoomed-out view
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
+// Sentinel-1 era: 1A launched 2014-04-03, no GRD before it; cap the future at
+// today. Bounds the date pickers so the year stays a sane 20xx.
+const S1_MIN_DATE = "2014-04-03";
+const TODAY = new Date().toISOString().slice(0, 10);
 
 function datetimeOf(from: string, to: string): string {
   return `${from}T00:00:00Z/${to}T23:59:59Z`;
+}
+
+/**
+ * Reprojection-mesh error budget (pixels) as a function of viewport zoom.
+ *
+ * The GCP warp is smooth, so a wide view tolerates a far looser mesh: each step
+ * down in zoom doubles the ground-meters per screen pixel, so sub-pixel mesh
+ * accuracy at z4 is invisible AND expensive, every extra triangle is another
+ * per-vertex GCP `inverse()` solve, which is the zoom-out bottleneck. Detail
+ * zooms keep the fine 0.75px mesh. Quantized into bands so the layer's
+ * `maxError` prop (and thus the mesh) only regenerates when crossing a band,
+ * not on every zoom delta. `maxError` is a public deck.gl-raster prop; changing
+ * it updates the mesh in place (no layer remount).
+ */
+function maxErrorForZoom(zoom: number): number {
+  // The warp is smooth bilinear and the imagery isn't terrain-corrected (layover
+  // already displaces by hundreds of m), so a 1-2px mesh error is invisible while
+  // roughly halving triangle count vs sub-pixel. Snappiness > sub-pixel fidelity.
+  if (zoom >= 9) return 1.5;
+  if (zoom >= 7) return 4;
+  if (zoom >= 5) return 10;
+  return 24;
 }
 
 type LoadStats = { loaded: number; failed: number; failures: { url: string; err: string }[] };
@@ -81,29 +111,34 @@ export default function App() {
   // One AbortController per generation; aborting on pol switch kills the old
   // pol's in-flight band fetches so they don't starve the new pol's requests.
   const genAbort = useRef<AbortController | null>(null);
-  // Aborts the in-flight STAC search when a new manual fetch supersedes it.
-  const fetchAbort = useRef<AbortController | null>(null);
 
   const [labelBeforeId, setLabelBeforeId] = useState<string | undefined>(undefined);
+  // The scenes currently LOADED into the mosaic (rendered as GCP-warped tiles).
   const [stacItems, setStacItems] = useState<PartialSTACItem[]>([]);
-  const [stacError, setStacError] = useState<string | null>(null);
-  // Fetching is MANUAL: nothing loads until the user hits FETCH VIEW or draws an
-  // AOI. `hasFetched` distinguishes the idle first-run state from an empty result.
-  const [fetching, setFetching] = useState(false);
-  const [hasFetched, setHasFetched] = useState(false);
+  // Loading is explicit: SEARCH finds candidates, then LOAD renders a mosaic.
+  // `hasLoaded` distinguishes the idle first-run state from an empty load.
+  const [hasLoaded, setHasLoaded] = useState(false);
+  // SEARCH VIEW: candidate search + coverage selection + date stepping. Isolated
+  // in a hook so a stac-map search component could drive the same surface later.
+  const search = useSceneSearch();
+  // Footprint coverage overlay: on after a search so you can see/step coverage,
+  // off once a mosaic is loaded (so the imagery reads cleanly).
+  const [previewMode, setPreviewMode] = useState(false);
 
-  const initialPrefs = useRef(loadLookPrefs()).current;
-  const [pol, setPol] = useState<Polarization>(initialPrefs.pol);
-  const [dbRange, setDbRange] = useState<[number, number]>(initialPrefs.dbRange);
-  const [gamma, setGamma] = useState<number>(initialPrefs.gamma);
+  // Saved session settings (look + search window + AOI + view). Seeds all the
+  // state below; falls back to the app defaults for any field left unsaved.
+  const saved = useRef(loadSettings()).current;
+  const [pol, setPol] = useState<Polarization>(saved.pol);
+  const [dbRange, setDbRange] = useState<[number, number]>(saved.dbRange);
+  const [gamma, setGamma] = useState<number>(saved.gamma);
 
   // Device is initialized by the deck overlay; kept for parity / future GPU work.
   const [, setDevice] = useState<Device | null>(null);
 
   const [labels, setLabels] = useState(false);
-  const [bbox, setBbox] = useState<[number, number, number, number]>(DEFAULT_BBOX);
-  const [dateFrom, setDateFrom] = useState(DEFAULT_DATE_FROM);
-  const [dateTo, setDateTo] = useState(DEFAULT_DATE_TO);
+  const [bbox, setBbox] = useState<[number, number, number, number]>(saved.bbox ?? DEFAULT_BBOX);
+  const [dateFrom, setDateFrom] = useState(saved.dateFrom ?? DEFAULT_DATE_FROM);
+  const [dateTo, setDateTo] = useState(saved.dateTo ?? DEFAULT_DATE_TO);
   const [marker, setMarker] = useState<{ lng: number; lat: number; label: string } | null>(null);
   const [showMarker, setShowMarker] = useState(false);
   const [drawing, setDrawing] = useState(false);
@@ -119,10 +154,39 @@ export default function App() {
   // Mirror the module-level load scoreboard into React state.
   useEffect(() => subscribeStats(setStats), []);
 
-  // Persist look prefs whenever they change.
-  useEffect(() => {
-    saveLookPrefs({ pol, dbRange, gamma });
-  }, [pol, dbRange, gamma]);
+  // Brief "Saved" / "Reset" confirmation on the settings buttons.
+  const [savedFlash, setSavedFlash] = useState<"" | "saved" | "reset">("");
+
+  // SAVE SETTINGS: capture the whole session (look + search window + AOI + the
+  // live map camera) to localStorage. Explicit, not auto, so the dash is a
+  // deliberate "remember this" rather than persisting every slider twitch.
+  const handleSaveSettings = useCallback(() => {
+    const map = mapRef.current?.getMap();
+    const c = map?.getCenter();
+    saveSettings({
+      pol,
+      dbRange,
+      gamma,
+      dateFrom,
+      dateTo,
+      bbox,
+      view: c ? { longitude: c.lng, latitude: c.lat, zoom: map!.getZoom() } : null,
+    });
+    setSavedFlash("saved");
+    setTimeout(() => setSavedFlash(""), 1400);
+  }, [pol, dbRange, gamma, dateFrom, dateTo, bbox]);
+
+  // RESET: clear saved settings and return the look + search window to defaults.
+  const handleResetSettings = useCallback(() => {
+    resetSettings();
+    setPol(DEFAULT_SETTINGS.pol);
+    setDbRange(DEFAULT_SETTINGS.dbRange);
+    setGamma(DEFAULT_SETTINGS.gamma);
+    setDateFrom(DEFAULT_DATE_FROM);
+    setDateTo(DEFAULT_DATE_TO);
+    setSavedFlash("reset");
+    setTimeout(() => setSavedFlash(""), 1400);
+  }, []);
 
   // Keyboard shortcuts. Letter keys ignored while typing; `/` search, `p` swap
   // polarization, `l` labels, `d` draw AOI, `m` marker.
@@ -180,65 +244,43 @@ export default function App() {
   // Fresh scoreboard on pol switch (layers remount and reload under the new pol).
   useEffect(() => resetStats(), [pol]);
 
-  // Abort any in-flight search when the component unmounts.
-  useEffect(() => () => fetchAbort.current?.abort(), []);
-
   /**
-   * The single, explicit STAC fetch. Nothing calls this on load, on geocode, or
-   * on a date edit. Only FETCH VIEW and DRAW AOI invoke it, each passing the AOI
-   * directly so we never race React state. The current date window is read live.
+   * Load a chosen set of scenes into the mosaic (the render step). Separate from
+   * search: search finds candidates, this renders them. Bumps fetchGen TOGETHER
+   * with the new scenes (batched into one render) so the MosaicLayer id changes
+   * exactly when the data does, forcing the inner TileLayer to re-traverse (it
+   * only re-runs getTileIndices on a viewport/prop change). Hides the footprint
+   * overlay so the imagery reads cleanly.
    */
-  const runFetch = useCallback(
+  const loadItems = useCallback((items: PartialSTACItem[]) => {
+    resetStats();
+    setStacItems(items);
+    setFetchGen((g) => g + 1);
+    setHasLoaded(true);
+    setPreviewMode(false);
+    console.info(`[load] ${items.length} S1 GRD scenes into the mosaic`);
+  }, []);
+
+  // SEARCH the current date window over an AOI. Shows the coverage overlay; does
+  // NOT load tiles (the user picks a mosaic to LOAD).
+  const runSearch = useCallback(
     (targetBbox: [number, number, number, number]) => {
-      fetchAbort.current?.abort();
-      const ac = new AbortController();
-      fetchAbort.current = ac;
       setBbox(targetBbox);
-      setStacError(null);
-      setFetching(true);
-      setHasFetched(true);
-      resetStats();
-      fetchStacItems({
-        datetime: datetimeOf(dateFrom, dateTo),
-        bbox: targetBbox,
-        maxItems: 3,
-        signal: ac.signal,
-      })
-        .then(({ items, rejected }) => {
-          if (ac.signal.aborted) return;
-          // Bump fetchGen TOGETHER with the new scenes (batched into one render)
-          // so the MosaicLayer id changes exactly when the data does. Bumping it
-          // earlier remounts with the OLD scenes, then keeps that id when the new
-          // ones arrive -> the inner TileLayer never re-traverses (stale tiles).
-          setStacItems(items);
-          setFetchGen((g) => g + 1);
-          console.info(`[stac] ${items.length} S1 GRD scenes (${rejected} unusable)`);
-          if (items.length === 0) {
-            setStacError("No Sentinel-1 GRD scenes here for this date window. Widen the dates or move the AOI, then fetch again.");
-          }
-        })
-        .catch((err) => {
-          if (err.name !== "AbortError") {
-            console.error("[stac] fetch failed:", err);
-            setStacError(String(err.message ?? err));
-          }
-        })
-        .finally(() => {
-          if (fetchAbort.current === ac) setFetching(false);
-        });
+      setMarker(null);
+      setPreviewMode(true);
+      search.search(targetBbox, datetimeOf(dateFrom, dateTo));
     },
-    [dateFrom, dateTo],
+    [search, dateFrom, dateTo],
   );
 
   const handleDrawBox = (bb: [number, number, number, number]) => {
-    setMarker(null);
     setDrawing(false);
-    runFetch(bb); // drawing an AOI is an explicit "load scenes here"
+    runSearch(bb); // drawing an AOI searches it
   };
 
-  // FETCH VIEW: build an AOI from the current view + small buffer, clamped so a
-  // zoomed-out view can't fan out into hundreds of COG opens, then fetch it.
-  const handleFetchViewport = () => {
+  // SEARCH VIEW: build an AOI from the current view + small buffer, clamped so a
+  // zoomed-out view can't fan out into hundreds of COG candidates, then search.
+  const handleSearchViewport = () => {
     const map = mapRef.current?.getMap();
     if (!map) return;
     const b = map.getBounds();
@@ -255,8 +297,15 @@ export default function App() {
     const maxHalf = MAX_VIEWPORT_SPAN_DEG / 2;
     const halfW = Math.min((e - w) / 2, maxHalf);
     const halfH = Math.min((n - s) / 2, maxHalf);
-    setMarker(null);
-    runFetch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
+    runSearch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
+  };
+
+  // LOAD the coverage-first "most complete" mosaic across the whole window.
+  const handleLoadMostComplete = () => loadItems(search.selection.items);
+  // LOAD only the date currently stepped to. Route through selectCoverageFirst so
+  // a date with many overlapping frames still respects the scene cap.
+  const handleLoadThisDate = () => {
+    if (search.current) loadItems(selectCoverageFirst(search.current.items).items);
   };
 
   const handleResetNorth = () => {
@@ -289,6 +338,9 @@ export default function App() {
     [stacItems, pol],
   );
 
+  // Banded so the mesh only regenerates when the band changes, not per zoom tick.
+  const meshMaxError = maxErrorForZoom(zoom);
+
   const layers = useMemo(() => {
     if (polItems.length === 0) return [];
     const pipeline = buildRenderPipeline({ dbRange, gamma });
@@ -319,8 +371,9 @@ export default function App() {
           // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
           // reprojection mesh looks identical to a fine one but builds far fewer
           // triangles and calls the (heavier) GCP inverse far fewer times.
-          // Default 0.125 px is overkill here and stutters; 0.75 px is plenty.
-          maxError: 0.75,
+          // Banded by viewport zoom (maxErrorForZoom): loose on wide views where
+          // sub-pixel mesh accuracy is invisible, fine on detail zooms.
+          maxError: meshMaxError,
           // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
           // concurrency so a wide view doesn't stampede range reads.
           maxRequests: 10,
@@ -336,12 +389,50 @@ export default function App() {
       beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [polItems, labelBeforeId, pol, gen, fetchGen, dbRange, gamma]);
+  }, [polItems, labelBeforeId, pol, gen, fetchGen, dbRange, gamma, meshMaxError]);
+
+  // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
+  // the "most complete" selection dim-teal, the rest faint. Sits above the
+  // raster, below labels. Only while previewing (cleared once a mosaic loads).
+  const footprintLayer = useMemo(() => {
+    if (!previewMode || search.candidates.length === 0) return null;
+    const activeIds = new Set((search.current?.items ?? []).map((i) => i.id));
+    const selectedIds = new Set(search.selection.items.map((i) => i.id));
+    const data = footprintCollection(search.candidates, activeIds, selectedIds);
+    return new GeoJsonLayer({
+      id: "coverage-footprints",
+      data: data as any,
+      stroked: true,
+      filled: true,
+      getFillColor: (f: any) =>
+        f.properties.active ? [125, 211, 192, 38]
+          : f.properties.selected ? [125, 211, 192, 12]
+          : [255, 255, 255, 6],
+      getLineColor: (f: any) =>
+        f.properties.active ? [125, 211, 192, 255]
+          : f.properties.selected ? [125, 211, 192, 130]
+          : [255, 255, 255, 64],
+      getLineWidth: (f: any) => (f.properties.active ? 2 : 1),
+      lineWidthUnits: "pixels",
+      pickable: false,
+      updateTriggers: {
+        getFillColor: [search.dateIdx, search.selection],
+        getLineColor: [search.dateIdx, search.selection],
+        getLineWidth: [search.dateIdx],
+      },
+      beforeId: labelBeforeId,
+    } as any);
+  }, [previewMode, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
+
+  const allLayers = useMemo(
+    () => (footprintLayer ? [...layers, footprintLayer] : layers),
+    [layers, footprintLayer],
+  );
 
   const initialViewState = {
-    longitude: -70.05,
-    latitude: -32.7,
-    zoom: 10,
+    longitude: saved.view?.longitude ?? -70.05,
+    latitude: saved.view?.latitude ?? -32.7,
+    zoom: saved.view?.zoom ?? 10,
     pitch: 0,
     bearing: 0,
   };
@@ -370,7 +461,7 @@ export default function App() {
           });
         }}
       >
-        <DeckGLOverlay layers={layers} onDevice={setDevice} />
+        <DeckGLOverlay layers={allLayers} onDevice={setDevice} />
         <DrawBbox mapRef={mapRef} active={drawing} onComplete={handleDrawBox} />
         {marker && showMarker && (
           <Marker longitude={marker.lng} latitude={marker.lat} anchor="bottom">
@@ -392,10 +483,14 @@ export default function App() {
       <InfoPanel
         sceneCount={polItems.length}
         totalCount={stacItems.length}
-        error={stacError}
-        fetching={fetching}
-        hasFetched={hasFetched}
+        hasLoaded={hasLoaded}
         stats={stats}
+        search={search}
+        previewMode={previewMode}
+        onTogglePreview={() => setPreviewMode((v) => !v)}
+        onSearchViewport={handleSearchViewport}
+        onLoadMostComplete={handleLoadMostComplete}
+        onLoadThisDate={handleLoadThisDate}
         pol={pol}
         onPolChange={setPol}
         dbRange={dbRange}
@@ -416,8 +511,10 @@ export default function App() {
         onToggleMarker={() => setShowMarker((v) => !v)}
         drawing={drawing}
         onToggleDraw={() => setDrawing((v) => !v)}
-        onFetchViewport={handleFetchViewport}
         onResetNorth={handleResetNorth}
+        onSaveSettings={handleSaveSettings}
+        onResetSettings={handleResetSettings}
+        savedFlash={savedFlash}
         zoom={zoom}
       />
     </div>
@@ -524,6 +621,46 @@ const dateInputStyle: React.CSSProperties = {
   colorScheme: "dark",
 };
 
+function StepButton({
+  onClick,
+  disabled,
+  children,
+  title,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      style={{
+        width: 30,
+        height: 30,
+        flexShrink: 0,
+        fontFamily: UI.mono,
+        fontSize: 12,
+        borderRadius: 4,
+        border: `1px solid ${UI.fieldBorder}`,
+        background: UI.field,
+        color: disabled ? UI.faint : UI.text,
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.45 : 1,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        lineHeight: 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** Dual-thumb range slider (Radix Slider primitive). */
 function RangeSlider({
   value,
@@ -613,10 +750,14 @@ function Slider({
 function InfoPanel({
   sceneCount,
   totalCount,
-  error,
-  fetching,
-  hasFetched,
+  hasLoaded,
   stats,
+  search,
+  previewMode,
+  onTogglePreview,
+  onSearchViewport,
+  onLoadMostComplete,
+  onLoadThisDate,
   pol,
   onPolChange,
   dbRange,
@@ -637,16 +778,22 @@ function InfoPanel({
   onToggleMarker,
   drawing,
   onToggleDraw,
-  onFetchViewport,
   onResetNorth,
+  onSaveSettings,
+  onResetSettings,
+  savedFlash,
   zoom,
 }: {
   sceneCount: number;
   totalCount: number;
-  error: string | null;
-  fetching: boolean;
-  hasFetched: boolean;
+  hasLoaded: boolean;
   stats: LoadStats;
+  search: SceneSearch;
+  previewMode: boolean;
+  onTogglePreview: () => void;
+  onSearchViewport: () => void;
+  onLoadMostComplete: () => void;
+  onLoadThisDate: () => void;
   pol: Polarization;
   onPolChange: (p: Polarization) => void;
   dbRange: [number, number];
@@ -667,12 +814,34 @@ function InfoPanel({
   onToggleMarker: () => void;
   drawing: boolean;
   onToggleDraw: () => void;
-  onFetchViewport: () => void;
   onResetNorth: () => void;
+  onSaveSettings: () => void;
+  onResetSettings: () => void;
+  savedFlash: "" | "saved" | "reset";
   zoom: number;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
+  const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
+  const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
+
+  let statusText: string;
+  let statusColor: string = UI.mute;
+  if (searchError) {
+    statusText = `STAC: ${searchError}`;
+    statusColor = "#f0a3a3";
+  } else if (searching) {
+    statusText = "searching scenes…";
+  } else if (hasLoaded) {
+    statusText = `${sceneCount} ${pol.toUpperCase()} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
+  } else if (hasSearched) {
+    statusText = candidates.length
+      ? `${candidates.length} candidates · ${dates.length} date${dates.length === 1 ? "" : "s"} · step and load below`
+      : "No Sentinel-1 GRD scenes here for this window. Widen the dates or move the AOI.";
+  } else {
+    statusText = "Search a date range over an area, then load a mosaic.";
+  }
+
   const copyFailures = () => {
     const text = stats.failures.map((f) => `${f.url}\n  ${f.err}`).join("\n\n");
     navigator.clipboard?.writeText(text).catch(() => {});
@@ -764,13 +933,14 @@ function InfoPanel({
         </div>
       </div>
 
-      {/* Area: search, date window, coverage status, view toggles */}
-      <Section label="Area" first>
+      {/* Search: place, date window, search action, view toggles */}
+      <Section label="Search" first>
         <PlaceSearch ref={searchRef} onPick={onPickPlace} />
         <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
           <input
             type="date"
             value={dateFrom}
+            min={S1_MIN_DATE}
             max={dateTo}
             onChange={(e) => onDateFromChange(e.target.value)}
             style={dateInputStyle}
@@ -780,41 +950,39 @@ function InfoPanel({
             type="date"
             value={dateTo}
             min={dateFrom}
+            max={TODAY}
             onChange={(e) => onDateToChange(e.target.value)}
             style={dateInputStyle}
           />
+        </div>
+        <div style={{ marginTop: 9, display: "flex", gap: 6 }}>
+          <Toggle active={searching} onClick={onSearchViewport} grow
+            title="Find Sentinel-1 scenes over the current view for this date window">
+            {searching ? "SEARCHING…" : "SEARCH VIEW"}
+          </Toggle>
+          <Toggle active={drawing} onClick={onToggleDraw} title="Drag a rectangle to search a specific AOI">
+            {drawing ? "DRAG BOX" : "DRAW AOI"}
+          </Toggle>
         </div>
         <div
           style={{
             fontFamily: UI.mono,
             fontSize: 11.5,
-            color: error ? "#f0a3a3" : UI.mute,
+            color: statusColor,
             marginTop: 8,
           }}
         >
-          {error
-            ? `STAC: ${error}`
-            : fetching
-              ? "fetching scenes…"
-              : !hasFetched
-                ? "Hit FETCH VIEW or draw an AOI to load Sentinel-1 scenes."
-                : `${sceneCount} ${pol.toUpperCase()} scenes · ${stats.loaded} loaded · ${stats.failed} failed · ${pending} pending`}
+          {statusText}
         </div>
-        {totalCount > sceneCount && !error && (
+        {(searching || (hasLoaded && pending > 0)) && (
+          <div className="s1-loadbar" style={{ marginTop: 8 }} aria-label="loading" />
+        )}
+        {hasLoaded && totalCount > sceneCount && !searchError && (
           <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 3 }}>
-            ({totalCount - sceneCount} scenes lack {pol.toUpperCase()})
+            ({totalCount - sceneCount} loaded scenes lack {pol.toUpperCase()})
           </div>
         )}
-        <div style={{ fontFamily: UI.mono, fontSize: 11.5, color: UI.accent, marginTop: 4 }}>
-          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
-        </div>
         <div style={{ marginTop: 9, display: "flex", flexWrap: "wrap", gap: 6 }}>
-          <Toggle active={drawing} onClick={onToggleDraw} title="Drag a rectangle to set the AOI">
-            {drawing ? "DRAW: DRAG BOX" : "DRAW AOI"}
-          </Toggle>
-          <Toggle active={false} onClick={onFetchViewport} title="Load scenes for the current view">
-            FETCH VIEW
-          </Toggle>
           <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
             LABELS {labels ? "ON" : "OFF"}
           </Toggle>
@@ -827,7 +995,57 @@ function InfoPanel({
             </Toggle>
           )}
         </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
+          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
+        </div>
       </Section>
+
+      {/* Coverage: step through candidate mosaics, load the most complete or one date */}
+      {showCoverage && (
+        <Section label="Coverage">
+          <div style={{ fontFamily: UI.mono, fontSize: 11.5, color: UI.mute }}>
+            most complete: {selection.items.length} scene{selection.items.length === 1 ? "" : "s"}
+            {" · "}{selection.dates.length} date{selection.dates.length === 1 ? "" : "s"}
+            {" · "}{selection.footprintsCovered} frame{selection.footprintsCovered === 1 ? "" : "s"}
+          </div>
+
+          {/* Date stepper: toggle through candidate dates, best coverage first */}
+          <div style={{ marginTop: 9, display: "flex", alignItems: "center", gap: 6 }}>
+            <StepButton onClick={() => search.step(-1)} disabled={dateIdx <= 0} title="Previous date">
+              ◀
+            </StepButton>
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontFamily: UI.mono, fontSize: 13, color: UI.text, letterSpacing: "0.04em" }}>
+                {current?.date ?? "—"}
+              </div>
+              <div style={{ fontFamily: UI.mono, fontSize: 10.5, color: UI.faint, marginTop: 1 }}>
+                {dates.length ? `${dateIdx + 1}/${dates.length}` : "0/0"}
+                {" · "}{current?.footprints ?? 0} frame{current?.footprints === 1 ? "" : "s"} this date
+              </div>
+            </div>
+            <StepButton onClick={() => search.step(1)} disabled={dateIdx >= dates.length - 1} title="Next date">
+              ▶
+            </StepButton>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <Toggle active onClick={onLoadMostComplete} grow
+              title="Render the coverage-first mosaic across the whole date window">
+              LOAD MOST COMPLETE
+            </Toggle>
+          </div>
+          <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+            <Toggle active={false} onClick={onLoadThisDate} grow
+              title="Render only the scenes from the stepped date">
+              LOAD THIS DATE
+            </Toggle>
+            <Toggle active={previewMode} onClick={onTogglePreview}
+              title="Show / hide the footprint coverage overlay on the map">
+              COVERAGE {previewMode ? "ON" : "OFF"}
+            </Toggle>
+          </div>
+        </Section>
+      )}
 
       {/* Render: polarization + dB stretch + gamma + colormap */}
       <Section label="Amplitude">
@@ -908,12 +1126,31 @@ function InfoPanel({
             onReset={() => onGammaChange(DEFAULT_GAMMA)}
           />
 
+          {/* DRAMATIC PRESET hidden for now (commented out per request).
           <div style={{ marginTop: 10 }}>
             <Toggle active={false} onClick={onDramatic} grow
               title="High-contrast preset: tighter dB window + raised gamma for inky shadows">
               DRAMATIC PRESET
             </Toggle>
           </div>
+          */}
+        </div>
+      </Section>
+
+      {/* Session: persist the look + search window + AOI + map view */}
+      <Section label="Session">
+        <div style={{ display: "flex", gap: 6 }}>
+          <Toggle active={savedFlash === "saved"} onClick={onSaveSettings} grow
+            title="Remember the look, search window, AOI, and map view for next time">
+            {savedFlash === "saved" ? "SAVED ✓" : "SAVE SETTINGS"}
+          </Toggle>
+          <Toggle active={savedFlash === "reset"} onClick={onResetSettings}
+            title="Forget saved settings; restore defaults">
+            {savedFlash === "reset" ? "RESET ✓" : "RESET"}
+          </Toggle>
+        </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6 }}>
+          Saves look, dates, AOI &amp; view to this browser.
         </div>
       </Section>
 

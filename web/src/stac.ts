@@ -23,6 +23,12 @@ const S1_BUCKET_HTTPS = "https://sentinel-s1-l1c.s3.eu-central-1.amazonaws.com/"
 
 export type Polarization = "vv" | "vh";
 
+/** A GeoJSON Polygon/MultiPolygon footprint (loosely typed to avoid a dep). */
+export type Footprint = {
+  type: "Polygon" | "MultiPolygon";
+  coordinates: number[][][] | number[][][][];
+};
+
 export type PartialSTACItem = {
   id: string;
   bbox: [number, number, number, number];
@@ -30,6 +36,10 @@ export type PartialSTACItem = {
   datetime: string;
   /** Ascending / descending pass; affects look-direction and relief shading. */
   orbit: "ascending" | "descending" | null;
+  /** Scene footprint polygon, for the coverage overlay + coverage grouping. */
+  geometry: Footprint | null;
+  /** Relative orbit number; repeat passes of one frame share it. Null if absent. */
+  relativeOrbit: number | null;
   assets: {
     /** https measurement-COG href; present only when the scene carries that pol. */
     vv?: { href: string };
@@ -40,10 +50,12 @@ export type PartialSTACItem = {
 type StacFeature = {
   id: string;
   bbox: [number, number, number, number];
+  geometry?: Footprint;
   assets: Record<string, { href?: string }>;
   properties?: {
     datetime?: string;
     "sat:orbit_state"?: string;
+    "sat:relative_orbit"?: number;
   };
 };
 
@@ -151,11 +163,14 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
         rejected += 1;
         continue;
       }
+      const ro = feat.properties?.["sat:relative_orbit"];
       items.push({
         id: feat.id,
         bbox: feat.bbox,
         datetime: feat.properties?.datetime ?? "",
         orbit: orbitOf(feat),
+        geometry: feat.geometry ?? null,
+        relativeOrbit: typeof ro === "number" ? ro : null,
         assets: {
           ...(vv ? { vv: { href: vv } } : {}),
           ...(vh ? { vh: { href: vh } } : {}),

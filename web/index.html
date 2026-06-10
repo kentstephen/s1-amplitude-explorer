@@ -63,6 +63,33 @@
       .range-slider-thumb:focus-visible {
         box-shadow: 0 0 0 3px rgba(125, 211, 192, 0.35);
       }
+
+      /* Indeterminate loading bar. Animates `transform` only, so it runs on the
+         compositor and keeps moving even when the main thread is briefly busy
+         building tile meshes, exactly when you want the "still working" signal. */
+      .s1-loadbar {
+        position: relative;
+        height: 3px;
+        width: 100%;
+        border-radius: 2px;
+        overflow: hidden;
+        background: rgba(125, 211, 192, 0.14);
+      }
+      .s1-loadbar::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        width: 40%;
+        border-radius: 2px;
+        background: #7dd3c0;
+        transform: translateX(-110%);
+        animation: s1-loadbar-slide 1.15s ease-in-out infinite;
+        will-change: transform;
+      }
+      @keyframes s1-loadbar-slide {
+        0%   { transform: translateX(-110%); }
+        100% { transform: translateX(260%); }
+      }
     </style>
   </head>
   <body>
