@@ -9,7 +9,71 @@
 
 ---
 
-## ⛳ STATUS — session 3 (2026-06-09 PM). READ THIS FIRST.
+## ⛳ STATUS — session 4 (2026-06-10). READ THIS FIRST.
+
+All four session-3 roadmap items shipped to `main` (see commits `16406e8`,
+`dcd49bd`):
+- **SEARCH VIEW** (was FETCH VIEW): search candidates over a date range, step
+  candidate mosaics with a footprint coverage overlay, then LOAD MOST COMPLETE /
+  LOAD THIS DATE. Logic in `useSceneSearch.ts` (stac-map-swappable seam) +
+  `footprints.ts` (overlay data) + a `GeoJsonLayer` in `App.tsx`.
+- **Coverage-first** (`coverage.ts`): `selectCoverageFirst` + `groupByDate`, S1
+  adaptation (no cloud; recency proxy; group by relative_orbit + bbox bucket).
+  HARD scene cap (default 3) so a dense area can't stack a dozen overlapping
+  scenes.
+- **Save settings** (`prefs.ts` v4): explicit SAVE/RESET of look + search window +
+  AOI + view; state seeds from saved on mount.
+- **Perf** (load + pan/zoom freeze): `gcp.ts inverse()` now affine-jumps to a 3x3
+  cell neighborhood (O(9) vs O(all-cells)) for in-swath points + O(1) affine for
+  off-swath; `maxError` banded by zoom; scene cap bounds concurrent main-thread
+  mesh builds. Mesh build is still SYNCHRONOUS main-thread (deck.gl-raster has no
+  worker) — that's the remaining perf ceiling. Diag counters: `globalThis.gcpInverseStats`.
+- Misc: segmented `MM/DD/20YY` date fields (type the 2-digit year); DRAMATIC
+  PRESET commented out.
+
+### TODO (deferred, discuss then build) — date stepping / temporal browse
+Stephen wants to step the date range with arrow keys, or maybe auto-advance.
+Undecided; design forks captured:
+- **What a step changes:** cheap *preview* stepping (footprint overlay only, today's
+  behavior) vs an *imagery flip-book* (each step LOADs + renders that date — a real
+  load each, since meshes build synchronously on the main thread).
+- **Across-dates vs one-frame-over-time:** today's stepper walks `groupByDate`
+  (coverage-ordered → geometry shuffles between steps). A real temporal browse
+  should LOCK to one footprint group and step its repeat passes (same geometry,
+  ~6-12 day revisit) → a *registered* time series where only the surface changes.
+  This is the compelling SAR loop.
+- **Auto-advance** is bounded by the synchronous mesh cost (~1 date/1-2s, not
+  smooth). For snappy playback: pre-load a locked frame's dates as separate layers
+  and toggle VISIBILITY (no rebuild) instead of remounting per date.
+- **Key conflict:** maplibre uses arrow keys to pan; bind stepping to `,`/`.` or
+  `[`/`]` (or capture arrows only in preview mode), Space for play/pause.
+- Leaning: lock-to-one-frame time series, `,`/`.` step + Space play, visibility-
+  toggle for snappiness. Confirm with Stephen before building.
+
+### Other deferred: 3D terrain (CONUS)
+Stephen wants a 3D mode draping amplitude over USGS 3DEP 1/3 arc-second DEM
+(~10m, matches S1), CONUS-only. Reverses the project's "no elevation" stance
+(noted). Key issue discussed: uncorrected GRD layover means the amplitude will
+NOT register tightly with the DEM in relief (displacement ~h/tan(incidence),
+hundreds of m in steep terrain). Cheapest path = lift the existing GCP mesh
+vertices to DEM-Z (drape, don't terrain-correct) — sell as "SAR relief over
+terrain," not orthorectified. Verify CORS + tile format on
+`prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/` before building. Reuse
+sibling `deckgl-raster-mapterhorn-s2` terrain code as reference.
+
+### Design note: colormaps (decided — skip single-band cmaps)
+A colormap on single-band amplitude/dB *hurts* readability: grayscale is what
+makes SAR read as relief/hillshade; a viridis-style ramp turns terrain into an
+abstract heatmap ("wouldn't know what I'm looking at"). The color that's actually
+informative in SAR is a **polarization composite** (R=VV, G=VH, B=VV/VH ratio):
+urban/double-bounce, vegetation/volume, water/specular separate by hue. That's a
+deliberate future mode (needs both pols loaded + an RGB composite shader), not a
+drop-in. Grayscale stays the headline; a subtle non-informational tint is the
+only styling option worth considering.
+
+---
+
+## ⛳ STATUS — session 3 (2026-06-09 PM).
 
 **C + D ARE DONE AND COMMITTED. Raw GRD renders in the browser through the GPU
 mesh.** Path C (the non-affine GCP tileset the lib flagged as "future") was built
