@@ -66,6 +66,20 @@ function datetimeOf(from: string, to: string): string {
   return `${a}T00:00:00Z/${b}T23:59:59Z`;
 }
 
+/** Min interactive zoom. Below this every loaded scene piles into one coarse
+ *  overview tile at once (N full-scene reprojection meshes on the main thread),
+ *  which is the zoom-out freeze. It's also below where 10 m S1 imagery says
+ *  anything. So we floor the camera here. */
+const MIN_ZOOM = 5;
+
+/** Do two [W,S,E,N] bboxes overlap? Used to cull scenes outside the view. */
+function bboxIntersects(
+  a: [number, number, number, number],
+  b: [number, number, number, number],
+): boolean {
+  return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+}
+
 /**
  * Build a self-describing export filename from the loaded mosaic so a folder of
  * captures is legible at a glance: pol, look direction, the acquisition-date span
@@ -152,6 +166,10 @@ export default function App() {
   const polGen = useRef(0);
   const prevPol = useRef<Polarization | null>(null);
   const prevMode = useRef<RenderMode | null>(null);
+  // Latest keyboard-command handlers, refreshed each render so the single mounted
+  // keydown listener never closes over stale callbacks (the handlers are defined
+  // further down; this ref is assigned once they exist).
+  const keyCmdRef = useRef<Record<string, (() => void) | undefined>>({});
   // One AbortController per generation; aborting on pol switch kills the old
   // pol's in-flight band fetches so they don't starve the new pol's requests.
   const genAbort = useRef<AbortController | null>(null);
@@ -217,6 +235,10 @@ export default function App() {
   const [drawing, setDrawing] = useState(false);
   const [stats, setStats] = useState<LoadStats>({ loaded: 0, failed: 0, failures: [] });
   const [zoom, setZoom] = useState<number>(8);
+  // Current view bbox (margin-expanded), refreshed on move-end. Scenes whose
+  // footprint falls outside it are dropped from the mosaic, so panning away frees
+  // their meshes/textures (they reload on return). Null = no cull yet (first load).
+  const [viewBounds, setViewBounds] = useState<[number, number, number, number] | null>(null);
   // Bumped on every manual fetch. Folded into the layer ids so the MosaicLayer
   // (and its inner TileLayer) remounts and re-traverses each fetch. Without it a
   // FETCH VIEW that doesn't move the viewport never reloads: TileLayer only
@@ -265,8 +287,9 @@ export default function App() {
     setTimeout(() => setSavedFlash(""), 1400);
   }, []);
 
-  // Keyboard shortcuts. Letter keys ignored while typing; `/` search, `p` swap
-  // polarization, `l` labels, `d` draw AOI, `m` marker.
+  // Keyboard shortcuts (mounted once; action handlers dispatched via keyCmdRef so
+  // they're never stale). Ignored while typing in a field. Avoids arrow keys (the
+  // map pans with those). See the footer for the live legend.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -277,10 +300,37 @@ export default function App() {
           t.tagName === "SELECT" ||
           t.isContentEditable);
       if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      const cmd = keyCmdRef.current;
       switch (e.key.toLowerCase()) {
         case "/":
           e.preventDefault();
           searchRef.current?.focus();
+          break;
+        case "s": // search THIS view
+          e.preventDefault();
+          cmd.searchView?.();
+          break;
+        case "enter": // load the most-complete mosaic for the current search
+          e.preventDefault();
+          cmd.loadMost?.();
+          break;
+        case "c": // toggle amplitude <-> composite
+          cmd.toggleMode?.();
+          break;
+        case "b": // toggle composite palette (cb-safe / natural)
+          cmd.togglePalette?.();
+          break;
+        case "g": // grab a PNG of the current view
+          cmd.capture?.();
+          break;
+        case "x": // toggle export mode
+          cmd.toggleExport?.();
+          break;
+        case "[": // step coverage date back
+          cmd.stepPrev?.();
+          break;
+        case "]": // step coverage date forward
+          cmd.stepNext?.();
           break;
         case "p":
           setPol((v) => (v === "vv" ? "vh" : "vv"));
@@ -428,6 +478,14 @@ export default function App() {
     [stacItems, pol, renderMode],
   );
 
+  // Cull to the current view: only scenes whose footprint intersects the (margin-
+  // expanded) viewport are handed to the mosaic, so off-screen meshes aren't built
+  // or held. This is the "only show what's in view" perf lever for zoom-out / pan.
+  const renderItems = useMemo(
+    () => (viewBounds ? polItems.filter((it) => bboxIntersects(it.bbox, viewBounds)) : polItems),
+    [polItems, viewBounds],
+  );
+
   // Live mirrors for the capture settle-wait (which runs outside React's render
   // cycle and needs the latest values without re-subscribing).
   const settledRef = useRef(settled);
@@ -442,8 +500,8 @@ export default function App() {
   useEffect(() => {
     if (!hasLoaded) return;
     const done = stats.loaded + stats.failed;
-    const pending = polItems.length - done;
-    if (polItems.length > 0 && pending <= 0) {
+    const pending = renderItems.length - done;
+    if (renderItems.length > 0 && pending <= 0) {
       setSettled(true);
       return;
     }
@@ -451,19 +509,24 @@ export default function App() {
     const idleMs = done > 0 ? 3500 : 12000;
     const id = window.setTimeout(() => setSettled(true), idleMs);
     return () => clearTimeout(id);
-  }, [stats, hasLoaded, polItems.length]);
+  }, [stats, hasLoaded, renderItems.length]);
 
   /**
-   * EXPORT a PNG of the current map. Waits for every source COG to settle
-   * (loaded + failed >= scene count, the same scoreboard the panel shows), gives
-   * the tiles / meshes a few frames to paint, then grabs the maplibre canvas
-   * (deck renders interleaved INTO it, so the basemap + amplitude are both in the
-   * grab). `capturing` drops the footprint overlay first so it isn't baked in.
-   * The DOM panel/marker are HTML, not canvas, so they never appear in the grab.
+   * EXPORT a PNG of exactly what's on the map (no UI: the panel and marker are
+   * HTML, not canvas, so they're never in the grab; the footprint overlay is
+   * dropped via `capturing`). Waits for the mosaic to settle, then reads the
+   * canvas.
+   *
+   * The catch: react-map-gl does not forward `preserveDrawingBuffer`, so the GL
+   * drawing buffer is cleared as soon as the JS task yields after a paint. A plain
+   * `toDataURL()` (which we reach via awaits) therefore returns a BLANK frame. The
+   * fix is to read SYNCHRONOUSLY inside maplibre's `render` event, in the same task
+   * as the draw, before the buffer is cleared. Deck renders interleaved into that
+   * same pass, so the basemap + amplitude/composite are both captured.
    */
   const captureExport = useCallback(async () => {
     const map = mapRef.current?.getMap();
-    if (!map || polItems.length === 0) return;
+    if (!map || renderItems.length === 0) return;
     setCapturing(true);
     try {
       // Wait for the mosaic to settle (idle, not "every scene opened" — some never
@@ -477,28 +540,59 @@ export default function App() {
         };
         tick();
       });
-      // Let the last tiles/meshes paint, then force one more frame.
-      await new Promise<void>((r) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => r())),
-      );
-      map.triggerRepaint();
-      await new Promise<void>((r) => setTimeout(() => r(), 500));
-      const canvas = map.getCanvas();
-      const url = canvas.toDataURL("image/png");
+      // Let the last tiles/meshes finish painting before the grab.
+      await new Promise<void>((r) => setTimeout(() => r(), 400));
+      // Grab inside the render event (synchronous, pre-buffer-clear).
+      const url = await new Promise<string>((resolve) => {
+        const grab = () => resolve(map.getCanvas().toDataURL("image/png"));
+        map.once("render", grab);
+        map.triggerRepaint();
+        // Fallback if no render fires (e.g. nothing changed): force one read.
+        setTimeout(() => {
+          map.off("render", grab);
+          resolve(map.getCanvas().toDataURL("image/png"));
+        }, 1200);
+      });
       const a = document.createElement("a");
       a.href = url;
-      a.download = exportFilename(map, polItems, pol, orbitFilter, renderMode);
+      a.download = exportFilename(map, renderItems, pol, orbitFilter, renderMode);
       a.click();
     } finally {
       setCapturing(false);
     }
-  }, [pol, polItems, orbitFilter, renderMode]);
+  }, [pol, renderItems, orbitFilter, renderMode]);
+
+  // Wire the keyboard commands to the current handlers (read by the mounted
+  // keydown listener via keyCmdRef). Reassigned every render so they're current.
+  keyCmdRef.current = {
+    searchView: handleSearchViewport,
+    loadMost: handleLoadMostComplete,
+    toggleMode: () => setRenderMode((m) => (m === "amplitude" ? "composite" : "amplitude")),
+    togglePalette: () => setCompositePalette((p) => (p === "cbSafe" ? "natural" : "cbSafe")),
+    capture: captureExport,
+    toggleExport: () => setExportMode((v) => !v),
+    stepPrev: () => search.step(-1),
+    stepNext: () => search.step(1),
+  };
+
+  // Refresh the cull bbox from the map, expanded by a half-viewport margin so
+  // scenes just off-screen stay loaded (no reload on a small pan). Called on
+  // move-end and on load.
+  const updateViewBounds = useCallback((map: {
+    getBounds: () => { getWest(): number; getSouth(): number; getEast(): number; getNorth(): number };
+  }) => {
+    const b = map.getBounds();
+    const w = b.getWest(), s = b.getSouth(), e = b.getEast(), n = b.getNorth();
+    const mx = (e - w) * 0.5;
+    const my = (n - s) * 0.5;
+    setViewBounds([w - mx, s - my, e + mx, n + my]);
+  }, []);
 
   // Banded so the mesh only regenerates when the band changes, not per zoom tick.
   const meshMaxError = maxErrorForZoom(zoom);
 
   const layers = useMemo(() => {
-    if (polItems.length === 0) return [];
+    if (renderItems.length === 0) return [];
     const composite = renderMode === "composite";
     // One pipeline + composite mapping per look: grayscale dB amplitude (single
     // `amp` slot) or the dual-pol VV/VH/ratio RGB composite (vv + vh slots).
@@ -509,7 +603,7 @@ export default function App() {
 
     const mosaic = new MosaicLayer<PartialSTACItem, null>({
       id: `s1-mosaic-${renderMode}-${pol}-${gen}-${fetchGen}`,
-      sources: polItems,
+      sources: renderItems,
       maxCacheSize: 0,
       // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
       // item's bbox for spatial indexing.
@@ -570,7 +664,7 @@ export default function App() {
       beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [polItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
+  }, [renderItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
   // the "most complete" selection dim-teal, the rest faint. Sits above the
@@ -623,16 +717,14 @@ export default function App() {
       <MaplibreMap
         ref={mapRef}
         initialViewState={initialViewState}
-        minZoom={3}
-        // Required so the WebGL backbuffer survives long enough for
-        // canvas.toDataURL() in captureExport; without it the grab is blank.
-        // (Valid maplibre MapOptions, but react-map-gl's prop types omit it.)
-        {...({ preserveDrawingBuffer: true } as any)}
+        minZoom={MIN_ZOOM}
         onMove={(e) => setZoom(e.viewState.zoom)}
+        onMoveEnd={(e) => updateViewBounds(e.target)}
         attributionControl={false}
         mapStyle={mapStyle}
         onLoad={(e) => {
           const map = e.target;
+          updateViewBounds(map);
           const ls = map.getStyle()?.layers ?? [];
           const firstSymbol = ls.find((l: any) => l.type === "symbol");
           setLabelBeforeId(firstSymbol?.id);
@@ -1644,12 +1736,19 @@ function InfoPanel({
           lineHeight: 1.4,
         }}
       >
-        <div style={{ color: UI.faint, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <span>
-            <span style={{ color: UI.mute }}>/</span> search&nbsp;&nbsp;
-            <span style={{ color: UI.mute }}>P</span> pol&nbsp;&nbsp;
-            <span style={{ color: UI.mute }}>L</span> labels&nbsp;&nbsp;
-            <span style={{ color: UI.mute }}>D</span> draw
+        <div style={{ color: UI.faint, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+          <span style={{ display: "flex", flexWrap: "wrap", columnGap: 10, rowGap: 3 }}>
+            <span><span style={{ color: UI.mute }}>/</span> search</span>
+            <span><span style={{ color: UI.mute }}>S</span> this view</span>
+            <span><span style={{ color: UI.mute }}>⏎</span> load</span>
+            <span><span style={{ color: UI.mute }}>C</span> composite</span>
+            <span><span style={{ color: UI.mute }}>B</span> palette</span>
+            <span><span style={{ color: UI.mute }}>G</span> grab PNG</span>
+            <span><span style={{ color: UI.mute }}>X</span> export</span>
+            <span><span style={{ color: UI.mute }}>[ ]</span> date</span>
+            <span><span style={{ color: UI.mute }}>P</span> pol</span>
+            <span><span style={{ color: UI.mute }}>L</span> labels</span>
+            <span><span style={{ color: UI.mute }}>D</span> draw</span>
           </span>
           <a
             href="https://github.com/kentstephen/s1-amplitude-explorer"
