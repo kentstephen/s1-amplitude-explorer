@@ -24,7 +24,9 @@ import { PlaceSearch } from "./PlaceSearch";
 import { GcpMultiCOGLayer } from "./GcpMultiCOGLayer";
 import {
   AMP_COMPOSITE,
+  POL_COMPOSITE,
   buildRenderPipeline,
+  buildCompositePipeline,
   DB_MAX,
   DB_MIN,
   DEFAULT_DB_RANGE,
@@ -32,6 +34,7 @@ import {
   DRAMATIC_DB_RANGE,
   DRAMATIC_GAMMA,
   POLARIZATIONS,
+  type RenderMode,
 } from "./renderPipeline";
 
 // Aconcagua / central Andes: steep relief, the canonical dramatic-SAR demo.
@@ -74,6 +77,7 @@ function exportFilename(
   items: PartialSTACItem[],
   pol: Polarization,
   orbit: OrbitFilter,
+  renderMode: RenderMode,
 ): string {
   const dates = items
     .map((i) => i.datetime?.slice(0, 10))
@@ -89,7 +93,8 @@ function exportFilename(
   const lat = `${Math.abs(c.lat).toFixed(2)}${c.lat >= 0 ? "N" : "S"}`;
   const lon = `${Math.abs(c.lng).toFixed(2)}${c.lng >= 0 ? "E" : "W"}`;
   const z = `z${map.getZoom().toFixed(1)}`;
-  return `s1-amp_${pol.toUpperCase()}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}.png`;
+  const band = renderMode === "composite" ? "RGB" : pol.toUpperCase();
+  return `s1-amp_${band}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}.png`;
 }
 
 /**
@@ -145,6 +150,7 @@ export default function App() {
   const sourcesCache = useRef(new Map<string, Record<string, { url: string }>>());
   const polGen = useRef(0);
   const prevPol = useRef<Polarization | null>(null);
+  const prevMode = useRef<RenderMode | null>(null);
   // One AbortController per generation; aborting on pol switch kills the old
   // pol's in-flight band fetches so they don't starve the new pol's requests.
   const genAbort = useRef<AbortController | null>(null);
@@ -190,6 +196,9 @@ export default function App() {
   const [pol, setPol] = useState<Polarization>(saved.pol);
   const [dbRange, setDbRange] = useState<[number, number]>(saved.dbRange);
   const [gamma, setGamma] = useState<number>(saved.gamma);
+  // Render look: single-pol grayscale amplitude (default, the headline) or the
+  // dual-pol VV/VH/ratio RGB composite. Composite needs BOTH pols of a scene.
+  const [renderMode, setRenderMode] = useState<RenderMode>(saved.renderMode);
 
   // Device is initialized by the deck overlay; kept for parity / future GPU work.
   const [, setDevice] = useState<Device | null>(null);
@@ -224,6 +233,7 @@ export default function App() {
     const c = map?.getCenter();
     saveSettings({
       pol,
+      renderMode,
       dbRange,
       gamma,
       dateFrom,
@@ -233,12 +243,13 @@ export default function App() {
     });
     setSavedFlash("saved");
     setTimeout(() => setSavedFlash(""), 1400);
-  }, [pol, dbRange, gamma, dateFrom, dateTo, bbox]);
+  }, [pol, renderMode, dbRange, gamma, dateFrom, dateTo, bbox]);
 
   // RESET: clear saved settings and return the look + search window to defaults.
   const handleResetSettings = useCallback(() => {
     resetSettings();
     setPol(DEFAULT_SETTINGS.pol);
+    setRenderMode(DEFAULT_SETTINGS.renderMode);
     setDbRange(DEFAULT_SETTINGS.dbRange);
     setGamma(DEFAULT_SETTINGS.gamma);
     setDateFrom(DEFAULT_DATE_FROM);
@@ -287,11 +298,14 @@ export default function App() {
     ? "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
     : "https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json";
 
-  // Bump a generation on pol change so the layer ids change, forcing deck.gl to
-  // unmount the old pol's tiles instead of leaving stale fetching tiles behind.
-  if (prevPol.current !== pol) {
+  // Bump a generation on pol OR render-mode change so the layer ids change,
+  // forcing deck.gl to unmount the old tiles instead of leaving stale fetching
+  // tiles behind. A mode switch also changes which COGs each scene opens (one pol
+  // vs both), so the sources cache must be cleared too.
+  if (prevPol.current !== pol || prevMode.current !== renderMode) {
     if (prevPol.current !== null) polGen.current += 1;
     prevPol.current = pol;
+    prevMode.current = renderMode;
     sourcesCache.current.clear();
     genAbort.current?.abort();
     genAbort.current = new AbortController();
@@ -300,8 +314,8 @@ export default function App() {
   const gen = polGen.current;
   const genSignal = genAbort.current.signal;
 
-  // Fresh scoreboard on pol switch (layers remount and reload under the new pol).
-  useEffect(() => resetStats(), [pol]);
+  // Fresh scoreboard on pol / mode switch (layers remount and reload).
+  useEffect(() => resetStats(), [pol, renderMode]);
 
   /**
    * Load a chosen set of scenes into the mosaic (the render step). Separate from
@@ -397,10 +411,14 @@ export default function App() {
     setGamma(DRAMATIC_GAMMA);
   };
 
-  // Only scenes carrying the selected polarization can render in this mode.
+  // Scenes that can render under the current look: amplitude needs the selected
+  // pol; the composite needs BOTH pols (it maps VV+VH to colour).
   const polItems = useMemo(
-    () => stacItems.filter((it) => it.assets[pol]),
-    [stacItems, pol],
+    () =>
+      renderMode === "composite"
+        ? stacItems.filter((it) => it.assets.vv && it.assets.vh)
+        : stacItems.filter((it) => it.assets[pol]),
+    [stacItems, pol, renderMode],
   );
 
   // Live mirrors for the capture settle-wait (which runs outside React's render
@@ -462,40 +480,65 @@ export default function App() {
       const url = canvas.toDataURL("image/png");
       const a = document.createElement("a");
       a.href = url;
-      a.download = exportFilename(map, polItems, pol, orbitFilter);
+      a.download = exportFilename(map, polItems, pol, orbitFilter, renderMode);
       a.click();
     } finally {
       setCapturing(false);
     }
-  }, [pol, polItems, orbitFilter]);
+  }, [pol, polItems, orbitFilter, renderMode]);
 
   // Banded so the mesh only regenerates when the band changes, not per zoom tick.
   const meshMaxError = maxErrorForZoom(zoom);
 
   const layers = useMemo(() => {
     if (polItems.length === 0) return [];
-    const pipeline = buildRenderPipeline({ dbRange, gamma });
+    const composite = renderMode === "composite";
+    // One pipeline + composite mapping per look: grayscale dB amplitude (single
+    // `amp` slot) or the dual-pol VV/VH/ratio RGB composite (vv + vh slots).
+    const pipeline = composite
+      ? buildCompositePipeline({ vvWindow: dbRange, gamma })
+      : buildRenderPipeline({ dbRange, gamma });
+    const bandComposite = composite ? POL_COMPOSITE : AMP_COMPOSITE;
 
     const mosaic = new MosaicLayer<PartialSTACItem, null>({
-      id: `s1-mosaic-${pol}-${gen}-${fetchGen}`,
+      id: `s1-mosaic-${renderMode}-${pol}-${gen}-${fetchGen}`,
       sources: polItems,
       maxCacheSize: 0,
       // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
       // item's bbox for spatial indexing.
       getSource: async () => null,
       renderSource: (source) => {
-        const href = source.assets[pol]?.href;
-        if (!href) return null;
-        const cacheKey = `${pol}-${source.id}`;
-        let sources = sourcesCache.current.get(cacheKey);
-        if (!sources) {
-          sources = { amp: { url: href } };
-          sourcesCache.current.set(cacheKey, sources);
+        // Amplitude opens one pol's COG; composite opens both (same scene, same
+        // GCP grid, so they're pixel-aligned). `sceneHref` is the dedupe key for
+        // the load scoreboard (one tally per scene, not per band).
+        const vvHref = source.assets.vv?.href;
+        const vhHref = source.assets.vh?.href;
+        let sources: Record<string, { url: string }> | undefined;
+        let sceneHref: string | undefined;
+        if (composite) {
+          if (!vvHref || !vhHref) return null;
+          sceneHref = vvHref;
+          const cacheKey = `comp-${source.id}`;
+          sources = sourcesCache.current.get(cacheKey);
+          if (!sources) {
+            sources = { vv: { url: vvHref }, vh: { url: vhHref } };
+            sourcesCache.current.set(cacheKey, sources);
+          }
+        } else {
+          sceneHref = source.assets[pol]?.href;
+          if (!sceneHref) return null;
+          const cacheKey = `${pol}-${source.id}`;
+          sources = sourcesCache.current.get(cacheKey);
+          if (!sources) {
+            sources = { amp: { url: sceneHref } };
+            sourcesCache.current.set(cacheKey, sources);
+          }
         }
+        const tally = sceneHref;
         return new GcpMultiCOGLayer({
-          id: `s1-multi-${pol}-${gen}-${fetchGen}-${source.id}`,
+          id: `s1-multi-${renderMode}-${pol}-${gen}-${fetchGen}-${source.id}`,
           sources,
-          composite: AMP_COMPOSITE,
+          composite: bandComposite,
           renderPipeline: pipeline,
           signal: genSignal,
           refinementStrategy: "best-available",
@@ -508,11 +551,11 @@ export default function App() {
           // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
           // concurrency so a wide view doesn't stampede range reads.
           maxRequests: 10,
-          onGeoTIFFLoad: () => reportLoaded(href),
+          onGeoTIFFLoad: () => reportLoaded(tally),
           onError: (e: unknown) =>
-            reportFailed(href, e instanceof Error ? e.message : String(e)),
+            reportFailed(tally, e instanceof Error ? e.message : String(e)),
           updateTriggers: {
-            renderTile: [pol, dbRange[0], dbRange[1], gamma],
+            renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma],
           },
         } as any);
       },
@@ -520,7 +563,7 @@ export default function App() {
       beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [polItems, labelBeforeId, pol, gen, fetchGen, dbRange, gamma, meshMaxError]);
+  }, [polItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
   // the "most complete" selection dim-teal, the rest faint. Sits above the
@@ -628,6 +671,8 @@ export default function App() {
         onLoadThisDate={handleLoadThisDate}
         pol={pol}
         onPolChange={setPol}
+        renderMode={renderMode}
+        onRenderModeChange={setRenderMode}
         dbRange={dbRange}
         onDbRangeChange={setDbRange}
         gamma={gamma}
@@ -683,7 +728,7 @@ const eyebrowStyle: React.CSSProperties = {
   letterSpacing: "0.14em",
   textTransform: "uppercase",
   color: UI.faint,
-  marginBottom: 8,
+  marginBottom: 6,
 };
 
 function Section({
@@ -698,8 +743,8 @@ function Section({
   return (
     <div
       style={{
-        marginTop: first ? 10 : 11,
-        paddingTop: first ? 0 : 10,
+        marginTop: first ? 8 : 9,
+        paddingTop: first ? 0 : 8,
         borderTop: first ? "none" : `1px solid ${UI.hairline}`,
       }}
     >
@@ -1011,6 +1056,8 @@ function InfoPanel({
   onLoadThisDate,
   pol,
   onPolChange,
+  renderMode,
+  onRenderModeChange,
   dbRange,
   onDbRangeChange,
   gamma,
@@ -1054,6 +1101,8 @@ function InfoPanel({
   onLoadThisDate: () => void;
   pol: Polarization;
   onPolChange: (p: Polarization) => void;
+  renderMode: RenderMode;
+  onRenderModeChange: (m: RenderMode) => void;
   dbRange: [number, number];
   onDbRangeChange: (r: [number, number]) => void;
   gamma: number;
@@ -1090,6 +1139,7 @@ function InfoPanel({
   const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
 
+  const bandLabel = renderMode === "composite" ? "VV+VH" : pol.toUpperCase();
   let statusText: string;
   let statusColor: string = UI.mute;
   if (searchError) {
@@ -1101,8 +1151,8 @@ function InfoPanel({
     // While loading, show the live pending count; once settled, drop it (the
     // leftover scenes simply had no tiles in view, they aren't stuck).
     statusText = settled
-      ? `${sceneCount} ${pol.toUpperCase()} · ${stats.loaded} drawn · ${stats.failed} failed`
-      : `${sceneCount} ${pol.toUpperCase()} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
+      ? `${sceneCount} ${bandLabel} · ${stats.loaded} drawn · ${stats.failed} failed`
+      : `${sceneCount} ${bandLabel} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
   } else if (hasSearched) {
     statusText = candidates.length
       ? `${candidates.length} candidates · ${dates.length} date${dates.length === 1 ? "" : "s"} · step and load below`
@@ -1157,7 +1207,7 @@ function InfoPanel({
         width: 324,
         maxHeight: "calc(100vh - 28px)",
         overflowY: "auto",
-        padding: "14px 16px 12px",
+        padding: "12px 16px 11px",
         background: "linear-gradient(180deg, rgba(15,19,25,0.82), rgba(10,13,18,0.78))",
         backdropFilter: "blur(14px)",
         WebkitBackdropFilter: "blur(14px)",
@@ -1234,7 +1284,7 @@ function InfoPanel({
         )}
         {hasLoaded && totalCount > sceneCount && !searchError && (
           <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 3 }}>
-            ({totalCount - sceneCount} loaded scenes lack {pol.toUpperCase()})
+            ({totalCount - sceneCount} loaded scenes lack {renderMode === "composite" ? "both pols" : pol.toUpperCase()})
           </div>
         )}
         <div style={{ marginTop: 9, display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -1302,20 +1352,53 @@ function InfoPanel({
         </Section>
       )}
 
-      {/* Render: polarization + dB stretch + gamma + colormap */}
-      <Section label="Amplitude">
+      {/* Render: mode + (pol) + dB stretch + gamma. Amplitude = single-pol
+          grayscale; Composite = dual-pol VV/VH/ratio false colour. */}
+      <Section label={renderMode === "composite" ? "Composite" : "Amplitude"}>
+        {/* Mode switch */}
         <div style={{ display: "flex", gap: 6 }}>
-          {POLARIZATIONS.map((p) => (
-            <Toggle key={p} active={pol === p} onClick={() => onPolChange(p)} grow
-              title={p === "vv" ? "Co-pol: cleanest terrain / surface look" : "Cross-pol: volume scattering (vegetation, rough)"}>
-              {p.toUpperCase()}
-            </Toggle>
-          ))}
+          <Toggle active={renderMode === "amplitude"} onClick={() => onRenderModeChange("amplitude")} grow
+            title="Single polarization, grayscale dB. The dramatic relief / texture look.">
+            AMPLITUDE
+          </Toggle>
+          <Toggle active={renderMode === "composite"} onClick={() => onRenderModeChange("composite")} grow
+            title="Dual-pol false colour: R=VV, G=VH, B=VV/VH ratio. Needs both pols of a scene.">
+            COMPOSITE
+          </Toggle>
         </div>
+
+        {/* Polarization: amplitude mode only (composite uses both) */}
+        {renderMode === "amplitude" && (
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            {POLARIZATIONS.map((p) => (
+              <Toggle key={p} active={pol === p} onClick={() => onPolChange(p)} grow
+                title={p === "vv" ? "Co-pol: cleanest terrain / surface look" : "Cross-pol: volume scattering (vegetation, rough)"}>
+                {p.toUpperCase()}
+              </Toggle>
+            ))}
+          </div>
+        )}
+
+        {/* Composite legend: what the colours mean (the learning bit) */}
+        {renderMode === "composite" && (
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
+            {[
+              ["#e06666", "R · VV", "rough ground, urban"],
+              ["#7dd37d", "G · VH", "vegetation / volume"],
+              ["#6fa8dc", "B · VV/VH", "smooth surfaces, water"],
+            ].map(([c, k, desc]) => (
+              <div key={k} style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: UI.mono, fontSize: 11 }}>
+                <span style={{ width: 9, height: 9, borderRadius: 2, background: c, flexShrink: 0 }} />
+                <span style={{ color: UI.text, width: 64 }}>{k}</span>
+                <span style={{ color: UI.faint }}>{desc}</span>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div
           style={{
-            marginTop: 10,
+            marginTop: 9,
             padding: "9px 11px 11px",
             border: `1px solid ${UI.hairline}`,
             borderRadius: 8,
@@ -1323,13 +1406,16 @@ function InfoPanel({
           }}
         >
           <div style={{ ...eyebrowStyle, color: UI.accent, letterSpacing: "0.1em", marginBottom: 2 }}>
-            {pol.toUpperCase()} · dB stretch
+            {renderMode === "composite" ? "VV/VH · dB stretch" : `${pol.toUpperCase()} · dB stretch`}
           </div>
 
-          {/* dB window (two-way stretch) */}
+          {/* dB window (two-way stretch). In composite mode this is the VV window;
+              VH tracks it shifted down, the ratio window is fixed. */}
           <div style={{ marginTop: 8 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ fontFamily: UI.mono, fontSize: 12, color: UI.mute }}>dB range</span>
+              <span style={{ fontFamily: UI.mono, fontSize: 12, color: UI.mute }}>
+                {renderMode === "composite" ? "VV dB" : "dB range"}
+              </span>
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <NumBox
                   value={dbRange[0]}
@@ -1513,39 +1599,38 @@ function InfoPanel({
         </Section>
       )}
 
-      {/* Footer: provenance */}
+      {/* Footer: keyboard hints + condensed provenance */}
       <div
         style={{
-          marginTop: 10,
-          paddingTop: 9,
+          marginTop: 9,
+          paddingTop: 8,
           borderTop: `1px solid ${UI.hairline}`,
           fontFamily: UI.mono,
           fontSize: 11,
-          lineHeight: 1.45,
+          lineHeight: 1.4,
         }}
       >
-        <div style={{ color: UI.faint }}>
-          <span style={{ color: UI.mute }}>/</span> search&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>P</span> pol&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>L</span> labels&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>D</span> draw
-        </div>
-        <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ color: UI.faint, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span>
+            <span style={{ color: UI.mute }}>/</span> search&nbsp;&nbsp;
+            <span style={{ color: UI.mute }}>P</span> pol&nbsp;&nbsp;
+            <span style={{ color: UI.mute }}>L</span> labels&nbsp;&nbsp;
+            <span style={{ color: UI.mute }}>D</span> draw
+          </span>
           <a
             href="https://github.com/kentstephen/s1-amplitude-explorer"
             target="_blank"
             rel="noreferrer"
             title="This project's source on GitHub"
-            style={{ color: UI.mute, display: "inline-flex", alignItems: "center", gap: 5, textDecoration: "none" }}
+            style={{ color: UI.mute, display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none" }}
           >
-            <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
             </svg>
-            View source
+            source
           </a>
         </div>
-        <div style={{ color: UI.faint, marginTop: 4 }}>
-          Data:{" "}
+        <div style={{ color: UI.faint, marginTop: 5 }}>
           <a
             href="https://registry.opendata.aws/sentinel-1/"
             target="_blank"
@@ -1555,10 +1640,7 @@ function InfoPanel({
           >
             Sentinel-1 GRD
           </a>{" "}
-          via Earth Search (AWS Open Data), GCP-warped in the browser
-        </div>
-        <div style={{ color: UI.faint, marginTop: 4 }}>
-          Built with{" "}
+          · Earth Search · GCP-warped via{" "}
           <a
             href="https://developmentseed.org/deck.gl-raster/"
             target="_blank"
@@ -1566,8 +1648,7 @@ function InfoPanel({
             style={{ color: UI.mute, textDecoration: "underline" }}
           >
             deck.gl-raster
-          </a>{" "}
-          by Development Seed
+          </a>
         </div>
       </div>
     </div>
