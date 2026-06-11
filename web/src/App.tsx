@@ -1240,6 +1240,7 @@ function InfoPanel({
   settled: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [showMore, setShowMore] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
   const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
@@ -1392,22 +1393,6 @@ function InfoPanel({
             ({totalCount - sceneCount} loaded scenes lack {renderMode === "composite" ? "both pols" : pol.toUpperCase()})
           </div>
         )}
-        <div style={{ marginTop: 9, display: "flex", flexWrap: "wrap", gap: 6 }}>
-          <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
-            LABELS {labels ? "ON" : "OFF"}
-          </Toggle>
-          <Toggle active={false} onClick={onResetNorth} title="Reset to north-up, flat">
-            NORTH ↑
-          </Toggle>
-          {hasMarker && (
-            <Toggle active={showMarker} onClick={onToggleMarker}>
-              {showMarker ? "HIDE MARKER" : "SHOW MARKER"}
-            </Toggle>
-          )}
-        </div>
-        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
-          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
-        </div>
       </Section>
 
       {/* Coverage: step through candidate mosaics, load the most complete or one date */}
@@ -1604,6 +1589,59 @@ function InfoPanel({
         </div>
       </Section>
 
+      {/* Progressive disclosure: the primary path (search -> load -> look) stays
+          above; secondary controls (view toggles, export, session) collapse here. */}
+      <button
+        type="button"
+        onClick={() => setShowMore((v) => !v)}
+        style={{
+          marginTop: 9,
+          paddingTop: 9,
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          background: "transparent",
+          border: "none",
+          borderTop: `1px solid ${UI.hairline}`,
+          color: UI.faint,
+          cursor: "pointer",
+          ...eyebrowStyle,
+          marginBottom: 0,
+        }}
+        title={showMore ? "Hide secondary controls" : "Show view, export, and session controls"}
+      >
+        <span style={{ width: 9, color: UI.mute }}>{showMore ? "▾" : "▸"}</span>
+        <span>{showMore ? "less" : "more"}</span>
+        {!showMore && (
+          <span style={{ letterSpacing: "0.04em", textTransform: "none", color: UI.faint, fontWeight: 400 }}>
+            view · export · session
+          </span>
+        )}
+      </button>
+
+      {showMore && (
+        <>
+      {/* View: labels, north reset, marker, live zoom readout */}
+      <Section label="View" first>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
+            LABELS {labels ? "ON" : "OFF"}
+          </Toggle>
+          <Toggle active={false} onClick={onResetNorth} title="Reset to north-up, flat">
+            NORTH ↑
+          </Toggle>
+          {hasMarker && (
+            <Toggle active={showMarker} onClick={onToggleMarker}>
+              {showMarker ? "HIDE MARKER" : "SHOW MARKER"}
+            </Toggle>
+          )}
+        </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
+          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
+        </div>
+      </Section>
+
       {/* Export: lift the interactive caps for a wide mosaic, then grab a PNG */}
       <Section label="Export">
         <div style={{ display: "flex", gap: 6 }}>
@@ -1667,6 +1705,8 @@ function InfoPanel({
           Saves look, dates, AOI &amp; view to this browser.
         </div>
       </Section>
+        </>
+      )}
 
       {/* Diagnostics: only when something failed to load */}
       {stats.failures.length > 0 && (
