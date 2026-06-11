@@ -44,14 +44,19 @@ export const POL_COMPOSITE = { r: "vv", g: "vh" } as const;
 export const COMPOSITE_VH_OFFSET = 7;
 export const COMPOSITE_RATIO_WINDOW: [number, number] = [2, 16];
 
+/** Composite colour palettes: the standard R/G/B false colour, or a red-green
+ *  colourblind-safe blue↔yellow + luminance mapping of the same data. */
+export type CompositePalette = "natural" | "cbSafe";
+
 /**
- * Dual-pol RGB composite pipeline (one module does dB, per-channel stretch, the
- * ratio, and gamma). `vvWindow` comes from the dB slider; `vhWindow` is it shifted
- * down by COMPOSITE_VH_OFFSET; the ratio window is fixed.
+ * Dual-pol composite pipeline (one module does dB, per-channel stretch, the
+ * ratio, gamma, and palette). `vvWindow` comes from the dB slider; `vhWindow` is
+ * it shifted down by COMPOSITE_VH_OFFSET; the ratio window is fixed.
  */
 export function buildCompositePipeline(opts: {
   vvWindow?: [number, number];
   gamma?: number;
+  palette?: CompositePalette;
 } = {}): RasterModule[] {
   const vv = opts.vvWindow ?? DEFAULT_DB_RANGE;
   const vh: [number, number] = [vv[0] - COMPOSITE_VH_OFFSET, vv[1] - COMPOSITE_VH_OFFSET];
@@ -63,6 +68,7 @@ export function buildCompositePipeline(opts: {
         vhWindow: vh,
         ratioWindow: COMPOSITE_RATIO_WINDOW,
         gamma: opts.gamma ?? DEFAULT_GAMMA,
+        palette: opts.palette === "cbSafe" ? 1 : 0,
       },
     },
   ];

@@ -35,6 +35,7 @@ import {
   DRAMATIC_GAMMA,
   POLARIZATIONS,
   type RenderMode,
+  type CompositePalette,
 } from "./renderPipeline";
 
 // Aconcagua / central Andes: steep relief, the canonical dramatic-SAR demo.
@@ -199,6 +200,10 @@ export default function App() {
   // Render look: single-pol grayscale amplitude (default, the headline) or the
   // dual-pol VV/VH/ratio RGB composite. Composite needs BOTH pols of a scene.
   const [renderMode, setRenderMode] = useState<RenderMode>(saved.renderMode);
+  // Composite palette. Default is the red-green colourblind-safe (blue↔yellow +
+  // luminance) mapping, not the standard R=VV/G=VH false colour, which is the
+  // worst case for a red-green dichromat. Natural RGB is one click away.
+  const [compositePalette, setCompositePalette] = useState<CompositePalette>(saved.compositePalette);
 
   // Device is initialized by the deck overlay; kept for parity / future GPU work.
   const [, setDevice] = useState<Device | null>(null);
@@ -234,6 +239,7 @@ export default function App() {
     saveSettings({
       pol,
       renderMode,
+      compositePalette,
       dbRange,
       gamma,
       dateFrom,
@@ -243,13 +249,14 @@ export default function App() {
     });
     setSavedFlash("saved");
     setTimeout(() => setSavedFlash(""), 1400);
-  }, [pol, renderMode, dbRange, gamma, dateFrom, dateTo, bbox]);
+  }, [pol, renderMode, compositePalette, dbRange, gamma, dateFrom, dateTo, bbox]);
 
   // RESET: clear saved settings and return the look + search window to defaults.
   const handleResetSettings = useCallback(() => {
     resetSettings();
     setPol(DEFAULT_SETTINGS.pol);
     setRenderMode(DEFAULT_SETTINGS.renderMode);
+    setCompositePalette(DEFAULT_SETTINGS.compositePalette);
     setDbRange(DEFAULT_SETTINGS.dbRange);
     setGamma(DEFAULT_SETTINGS.gamma);
     setDateFrom(DEFAULT_DATE_FROM);
@@ -496,7 +503,7 @@ export default function App() {
     // One pipeline + composite mapping per look: grayscale dB amplitude (single
     // `amp` slot) or the dual-pol VV/VH/ratio RGB composite (vv + vh slots).
     const pipeline = composite
-      ? buildCompositePipeline({ vvWindow: dbRange, gamma })
+      ? buildCompositePipeline({ vvWindow: dbRange, gamma, palette: compositePalette })
       : buildRenderPipeline({ dbRange, gamma });
     const bandComposite = composite ? POL_COMPOSITE : AMP_COMPOSITE;
 
@@ -555,7 +562,7 @@ export default function App() {
           onError: (e: unknown) =>
             reportFailed(tally, e instanceof Error ? e.message : String(e)),
           updateTriggers: {
-            renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma],
+            renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma, compositePalette],
           },
         } as any);
       },
@@ -563,7 +570,7 @@ export default function App() {
       beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [polItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError]);
+  }, [polItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
   // the "most complete" selection dim-teal, the rest faint. Sits above the
@@ -673,6 +680,8 @@ export default function App() {
         onPolChange={setPol}
         renderMode={renderMode}
         onRenderModeChange={setRenderMode}
+        compositePalette={compositePalette}
+        onCompositePaletteChange={setCompositePalette}
         dbRange={dbRange}
         onDbRangeChange={setDbRange}
         gamma={gamma}
@@ -1058,6 +1067,8 @@ function InfoPanel({
   onPolChange,
   renderMode,
   onRenderModeChange,
+  compositePalette,
+  onCompositePaletteChange,
   dbRange,
   onDbRangeChange,
   gamma,
@@ -1103,6 +1114,8 @@ function InfoPanel({
   onPolChange: (p: Polarization) => void;
   renderMode: RenderMode;
   onRenderModeChange: (m: RenderMode) => void;
+  compositePalette: CompositePalette;
+  onCompositePaletteChange: (p: CompositePalette) => void;
   dbRange: [number, number];
   onDbRangeChange: (r: [number, number]) => void;
   gamma: number;
@@ -1379,14 +1392,35 @@ function InfoPanel({
           </div>
         )}
 
-        {/* Composite legend: what the colours mean (the learning bit) */}
+        {/* Composite palette: colourblind-safe (default) vs natural R/G/B */}
+        {renderMode === "composite" && (
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <Toggle active={compositePalette === "cbSafe"} onClick={() => onCompositePaletteChange("cbSafe")} grow
+              title="Red-green colourblind-safe: VV→brightness, VV/VH ratio→blue↔yellow.">
+              CB-SAFE
+            </Toggle>
+            <Toggle active={compositePalette === "natural"} onClick={() => onCompositePaletteChange("natural")} grow
+              title="Standard S1 false colour: R=VV, G=VH, B=VV/VH ratio.">
+              NATURAL
+            </Toggle>
+          </div>
+        )}
+
+        {/* Composite legend: what the colours mean (the learning bit), per palette */}
         {renderMode === "composite" && (
           <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
-            {[
-              ["#e06666", "R · VV", "rough ground, urban"],
-              ["#7dd37d", "G · VH", "vegetation / volume"],
-              ["#6fa8dc", "B · VV/VH", "smooth surfaces, water"],
-            ].map(([c, k, desc]) => (
+            {(compositePalette === "cbSafe"
+              ? [
+                  ["#facc15", "yellow", "vegetation / volume"],
+                  ["#3b82f6", "blue", "smooth surfaces, water"],
+                  ["#d1d5db", "bright", "VV: rough / strong relief"],
+                ]
+              : [
+                  ["#e06666", "R · VV", "rough ground, urban"],
+                  ["#7dd37d", "G · VH", "vegetation / volume"],
+                  ["#6fa8dc", "B · VV/VH", "smooth surfaces, water"],
+                ]
+            ).map(([c, k, desc]) => (
               <div key={k} style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: UI.mono, fontSize: 11 }}>
                 <span style={{ width: 9, height: 9, borderRadius: 2, background: c, flexShrink: 0 }} />
                 <span style={{ color: UI.text, width: 64 }}>{k}</span>

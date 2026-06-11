@@ -29,10 +29,11 @@ export const PolCompositeToRgb = {
   name: "polComposite",
   fs: /* glsl */ `
 uniform polCompositeUniforms {
-  vec2 vvWindow;     // dB [min, max] mapped to red
-  vec2 vhWindow;     // dB [min, max] mapped to green
+  vec2 vvWindow;     // dB [min, max] mapped to red (natural) / brightness (cb-safe)
+  vec2 vhWindow;     // dB [min, max] mapped to green (natural)
   vec2 ratioWindow;  // dB [min, max] mapped to blue (VV - VH)
   float gamma;
+  float palette;     // 0 = natural R/G/B, 1 = colorblind-safe blue↔yellow
 } polComposite;
 `,
   inject: {
@@ -45,11 +46,28 @@ uniform polCompositeUniforms {
       float vhDb = 20.0 * log(vhAmp) / log(10.0);
       float ratioDb = vvDb - vhDb;                 // = 20·log10(VV / VH)
 
-      vec3 raw = vec3(vvDb, vhDb, ratioDb);
-      vec3 lo = vec3(polComposite.vvWindow.x, polComposite.vhWindow.x, polComposite.ratioWindow.x);
-      vec3 hi = vec3(polComposite.vvWindow.y, polComposite.vhWindow.y, polComposite.ratioWindow.y);
-      vec3 rgb = clamp((raw - lo) / max(hi - lo, vec3(1e-4)), 0.0, 1.0);
-      rgb = pow(rgb, vec3(polComposite.gamma));
+      float vvN = clamp((vvDb - polComposite.vvWindow.x) / max(polComposite.vvWindow.y - polComposite.vvWindow.x, 1e-4), 0.0, 1.0);
+      float vhN = clamp((vhDb - polComposite.vhWindow.x) / max(polComposite.vhWindow.y - polComposite.vhWindow.x, 1e-4), 0.0, 1.0);
+      float ratioN = clamp((ratioDb - polComposite.ratioWindow.x) / max(polComposite.ratioWindow.y - polComposite.ratioWindow.x, 1e-4), 0.0, 1.0);
+
+      vec3 rgb;
+      if (polComposite.palette > 0.5) {
+        // COLORBLIND-SAFE: a red-green dichromat can't separate the R=VV/G=VH
+        // channels, so collapse to the two axes they CAN see — luminance and
+        // blue↔yellow. VV drives brightness (keeps the relief/roughness look);
+        // the VV/VH ratio drives hue: high ratio = smooth/open → blue, low ratio
+        // = volume scatter/vegetation → yellow. (A dichromat has only ~2 useful
+        // colour dims, so honestly mapping two variables beats faking three.)
+        float veg = 1.0 - ratioN;                  // 1 = vegetation, 0 = smooth
+        vec3 blue   = vec3(0.20, 0.45, 0.95);
+        vec3 yellow = vec3(1.00, 0.82, 0.15);
+        vec3 hue = mix(blue, yellow, veg);
+        rgb = hue * (0.22 + 0.78 * vvN);
+      } else {
+        // NATURAL: the standard S1 false colour. R=VV, G=VH, B=VV/VH ratio.
+        rgb = vec3(vvN, vhN, ratioN);
+      }
+      rgb = pow(max(rgb, 0.0), vec3(polComposite.gamma));
 
       color = vec4(rgb, color.a);
     `,
@@ -59,21 +77,25 @@ uniform polCompositeUniforms {
     vhWindow: "vec2<f32>",
     ratioWindow: "vec2<f32>",
     gamma: "f32",
+    palette: "f32",
   },
   getUniforms: (props: {
     vvWindow?: [number, number];
     vhWindow?: [number, number];
     ratioWindow?: [number, number];
     gamma?: number;
+    palette?: number;
   }) => ({
     vvWindow: props.vvWindow ?? [-65, -45],
     vhWindow: props.vhWindow ?? [-72, -52],
     ratioWindow: props.ratioWindow ?? [2, 16],
     gamma: props.gamma ?? 1.0,
+    palette: props.palette ?? 0,
   }),
 } as const satisfies ShaderModule<{
   vvWindow: [number, number];
   vhWindow: [number, number];
   ratioWindow: [number, number];
   gamma: number;
+  palette: number;
 }>;
