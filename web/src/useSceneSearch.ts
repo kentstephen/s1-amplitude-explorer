@@ -51,7 +51,12 @@ export type SceneSearch = {
   reset: () => void;
 };
 
-export function useSceneSearch(): SceneSearch {
+/**
+ * @param maxScenes optional hard cap on scenes in the "most complete" selection.
+ *   Undefined keeps `selectCoverageFirst`'s interactive default (3). Export mode
+ *   passes a far higher cap so a wide AOI can mosaic many frames.
+ */
+export function useSceneSearch(maxScenes?: number): SceneSearch {
   const abort = useRef<AbortController | null>(null);
   const [candidates, setCandidates] = useState<PartialSTACItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -89,7 +94,10 @@ export function useSceneSearch(): SceneSearch {
   );
 
   const dates = useMemo(() => groupByDate(candidates), [candidates]);
-  const selection = useMemo(() => selectCoverageFirst(candidates), [candidates]);
+  const selection = useMemo(
+    () => selectCoverageFirst(candidates, { maxScenes }),
+    [candidates, maxScenes],
+  );
   const current = dates[dateIdx] ?? null;
 
   const step = useCallback(

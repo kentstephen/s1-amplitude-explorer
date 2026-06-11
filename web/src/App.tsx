@@ -47,6 +47,15 @@ const DEFAULT_DATE_TO = "2026-06-05";
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
 
+// EXPORT MODE caps. The interactive caps above are tuned for smooth panning
+// (each scene is one full-scene reprojection mesh built SYNCHRONOUSLY on the main
+// thread, so a low scene count keeps zoom-out responsive). A still capture does
+// not pan: we load once, let it settle, and grab the canvas. So export mode trades
+// interactivity for coverage, lifting both the AOI span and the scene cap far
+// enough to mosaic a wide range (e.g. the full Caucasus, ~10 deg, ~10-15 frames).
+const EXPORT_MAX_VIEWPORT_SPAN_DEG = 14.0;
+const EXPORT_MAX_SCENES = 30;
+
 function datetimeOf(from: string, to: string): string {
   // Tolerate a reversed range (the segmented date fields don't link min/max).
   const [a, b] = from <= to ? [from, to] : [to, from];
@@ -116,9 +125,17 @@ export default function App() {
   // Loading is explicit: SEARCH finds candidates, then LOAD renders a mosaic.
   // `hasLoaded` distinguishes the idle first-run state from an empty load.
   const [hasLoaded, setHasLoaded] = useState(false);
+  // EXPORT MODE: lifts the interactive scene/span caps so a wide AOI can mosaic
+  // many frames for a still capture (load once, settle, grab the canvas). Off by
+  // default so normal browsing stays smooth.
+  const [exportMode, setExportMode] = useState(false);
+  // `capturing` blanks transient overlays (footprints) and the chrome while the
+  // canvas is grabbed, so they aren't baked into the PNG.
+  const [capturing, setCapturing] = useState(false);
   // SEARCH VIEW: candidate search + coverage selection + date stepping. Isolated
   // in a hook so a stac-map search component could drive the same surface later.
-  const search = useSceneSearch();
+  // In export mode the "most complete" selection keeps far more scenes.
+  const search = useSceneSearch(exportMode ? EXPORT_MAX_SCENES : undefined);
   // Footprint coverage overlay: on after a search so you can see/step coverage,
   // off once a mosaic is loaded (so the imagery reads cleanly).
   const [previewMode, setPreviewMode] = useState(false);
@@ -292,7 +309,8 @@ export default function App() {
     w -= dw; e += dw; s -= dh; n += dh;
     const cx = (w + e) / 2;
     const cy = (s + n) / 2;
-    const maxHalf = MAX_VIEWPORT_SPAN_DEG / 2;
+    const spanCap = exportMode ? EXPORT_MAX_VIEWPORT_SPAN_DEG : MAX_VIEWPORT_SPAN_DEG;
+    const maxHalf = spanCap / 2;
     const halfW = Math.min((e - w) / 2, maxHalf);
     const halfH = Math.min((n - s) / 2, maxHalf);
     runSearch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
@@ -303,7 +321,12 @@ export default function App() {
   // LOAD only the date currently stepped to. Route through selectCoverageFirst so
   // a date with many overlapping frames still respects the scene cap.
   const handleLoadThisDate = () => {
-    if (search.current) loadItems(selectCoverageFirst(search.current.items).items);
+    if (search.current)
+      loadItems(
+        selectCoverageFirst(search.current.items, {
+          maxScenes: exportMode ? EXPORT_MAX_SCENES : undefined,
+        }).items,
+      );
   };
 
   const handleResetNorth = () => {
@@ -335,6 +358,56 @@ export default function App() {
     () => stacItems.filter((it) => it.assets[pol]),
     [stacItems, pol],
   );
+
+  // Live mirrors for the capture settle-wait (which runs outside React's render
+  // cycle and needs the latest values without re-subscribing).
+  const statsRef = useRef(stats);
+  statsRef.current = stats;
+  const sceneCountRef = useRef(polItems.length);
+  sceneCountRef.current = polItems.length;
+
+  /**
+   * EXPORT a PNG of the current map. Waits for every source COG to settle
+   * (loaded + failed >= scene count, the same scoreboard the panel shows), gives
+   * the tiles / meshes a few frames to paint, then grabs the maplibre canvas
+   * (deck renders interleaved INTO it, so the basemap + amplitude are both in the
+   * grab). `capturing` drops the footprint overlay first so it isn't baked in.
+   * The DOM panel/marker are HTML, not canvas, so they never appear in the grab.
+   */
+  const captureExport = useCallback(async () => {
+    const map = mapRef.current?.getMap();
+    if (!map || sceneCountRef.current === 0) return;
+    setCapturing(true);
+    try {
+      // Wait for all scenes to open (bounded so a stuck COG can't hang forever).
+      const deadline = Date.now() + 45000;
+      await new Promise<void>((resolve) => {
+        const tick = () => {
+          const s = statsRef.current;
+          const n = sceneCountRef.current;
+          if (n > 0 && s.loaded + s.failed >= n) return resolve();
+          if (Date.now() > deadline) return resolve();
+          setTimeout(tick, 250);
+        };
+        tick();
+      });
+      // Let the last tiles/meshes paint, then force one more frame.
+      await new Promise<void>((r) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => r())),
+      );
+      map.triggerRepaint();
+      await new Promise<void>((r) => setTimeout(() => r(), 500));
+      const canvas = map.getCanvas();
+      const url = canvas.toDataURL("image/png");
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.href = url;
+      a.download = `s1-amplitude-${pol}-${stamp}.png`;
+      a.click();
+    } finally {
+      setCapturing(false);
+    }
+  }, [pol]);
 
   // Banded so the mesh only regenerates when the band changes, not per zoom tick.
   const meshMaxError = maxErrorForZoom(zoom);
@@ -393,7 +466,7 @@ export default function App() {
   // the "most complete" selection dim-teal, the rest faint. Sits above the
   // raster, below labels. Only while previewing (cleared once a mosaic loads).
   const footprintLayer = useMemo(() => {
-    if (!previewMode || search.candidates.length === 0) return null;
+    if (!previewMode || capturing || search.candidates.length === 0) return null;
     const activeIds = new Set((search.current?.items ?? []).map((i) => i.id));
     const selectedIds = new Set(search.selection.items.map((i) => i.id));
     const data = footprintCollection(search.candidates, activeIds, selectedIds);
@@ -420,7 +493,7 @@ export default function App() {
       },
       beforeId: labelBeforeId,
     } as any);
-  }, [previewMode, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
+  }, [previewMode, capturing, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
 
   const allLayers = useMemo(
     () => (footprintLayer ? [...layers, footprintLayer] : layers),
@@ -441,6 +514,10 @@ export default function App() {
         ref={mapRef}
         initialViewState={initialViewState}
         minZoom={3}
+        // Required so the WebGL backbuffer survives long enough for
+        // canvas.toDataURL() in captureExport; without it the grab is blank.
+        // (Valid maplibre MapOptions, but react-map-gl's prop types omit it.)
+        {...({ preserveDrawingBuffer: true } as any)}
         onMove={(e) => setZoom(e.viewState.zoom)}
         attributionControl={false}
         mapStyle={mapStyle}
@@ -514,6 +591,10 @@ export default function App() {
         onResetSettings={handleResetSettings}
         savedFlash={savedFlash}
         zoom={zoom}
+        exportMode={exportMode}
+        onToggleExportMode={() => setExportMode((v) => !v)}
+        onCapture={captureExport}
+        capturing={capturing}
       />
     </div>
   );
@@ -890,6 +971,10 @@ function InfoPanel({
   onResetSettings,
   savedFlash,
   zoom,
+  exportMode,
+  onToggleExportMode,
+  onCapture,
+  capturing,
 }: {
   sceneCount: number;
   totalCount: number;
@@ -926,6 +1011,10 @@ function InfoPanel({
   onResetSettings: () => void;
   savedFlash: "" | "saved" | "reset";
   zoom: number;
+  exportMode: boolean;
+  onToggleExportMode: () => void;
+  onCapture: () => void;
+  capturing: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
@@ -1228,6 +1317,32 @@ function InfoPanel({
           </div>
           */}
         </div>
+      </Section>
+
+      {/* Export: lift the interactive caps for a wide mosaic, then grab a PNG */}
+      <Section label="Export">
+        <div style={{ display: "flex", gap: 6 }}>
+          <Toggle active={exportMode} onClick={onToggleExportMode} grow
+            title="Lift the scene/AOI caps so a wide range can mosaic. Panning gets slow; that's fine for a still.">
+            EXPORT MODE {exportMode ? "ON" : "OFF"}
+          </Toggle>
+        </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6, lineHeight: 1.45 }}>
+          {exportMode
+            ? `Wide AOI + up to ${EXPORT_MAX_SCENES} scenes. SEARCH VIEW, LOAD, let it settle, then capture.`
+            : "Off: 3-scene cap for smooth panning. Turn on to mosaic a wide range."}
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <Toggle active={capturing} onClick={onCapture} grow
+            title="Wait for all scenes to finish loading, then download a PNG of the map (no UI chrome).">
+            {capturing ? "CAPTURING…" : "CAPTURE PNG"}
+          </Toggle>
+        </div>
+        {sceneCount === 0 && (
+          <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6 }}>
+            Load a mosaic first; capture grabs what's on the map.
+          </div>
+        )}
       </Section>
 
       {/* Session: persist the look + search window + AOI + map view */}
