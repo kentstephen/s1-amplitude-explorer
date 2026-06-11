@@ -162,6 +162,13 @@ export default function App() {
   // `capturing` blanks transient overlays (footprints) and the chrome while the
   // canvas is grabbed, so they aren't baked into the PNG.
   const [capturing, setCapturing] = useState(false);
+  // `settled` = the mosaic has stopped loading. NOT "every scene opened": at any
+  // viewport some loaded scenes never request tiles (out of view, fully
+  // overlapped), so their `onGeoTIFFLoad` never fires and the raw loaded count
+  // plateaus BELOW the scene count. Keying the load bar / capture on a full count
+  // spins forever (worst in export mode, with many scenes). Instead we settle on
+  // IDLE: no new load activity for a short grace window. See the effect below.
+  const [settled, setSettled] = useState(true);
   // Orbit-direction lock. Ascending and descending light opposite slope faces, so
   // mixing them across a wide mosaic gives the worst tonal seams; locking one
   // direction is the cheapest way to make the frames read as one consistent scene.
@@ -398,10 +405,28 @@ export default function App() {
 
   // Live mirrors for the capture settle-wait (which runs outside React's render
   // cycle and needs the latest values without re-subscribing).
-  const statsRef = useRef(stats);
-  statsRef.current = stats;
-  const sceneCountRef = useRef(polItems.length);
-  sceneCountRef.current = polItems.length;
+  const settledRef = useRef(settled);
+  settledRef.current = settled;
+
+  // IDLE settle: re-arm a short timer on every load-count change; when the counts
+  // stop moving (or all scenes that will load have), mark the mosaic settled. The
+  // first scene gets a long grace (a big synchronous mesh build can stall the main
+  // thread for seconds before the count first moves); once scenes are flowing, a
+  // short idle window ends the load. This is what stops the load bar spinning when
+  // some scenes never request tiles.
+  useEffect(() => {
+    if (!hasLoaded) return;
+    const done = stats.loaded + stats.failed;
+    const pending = polItems.length - done;
+    if (polItems.length > 0 && pending <= 0) {
+      setSettled(true);
+      return;
+    }
+    setSettled(false);
+    const idleMs = done > 0 ? 3500 : 12000;
+    const id = window.setTimeout(() => setSettled(true), idleMs);
+    return () => clearTimeout(id);
+  }, [stats, hasLoaded, polItems.length]);
 
   /**
    * EXPORT a PNG of the current map. Waits for every source COG to settle
@@ -413,18 +438,17 @@ export default function App() {
    */
   const captureExport = useCallback(async () => {
     const map = mapRef.current?.getMap();
-    if (!map || sceneCountRef.current === 0) return;
+    if (!map || polItems.length === 0) return;
     setCapturing(true);
     try {
-      // Wait for all scenes to open (bounded so a stuck COG can't hang forever).
+      // Wait for the mosaic to settle (idle, not "every scene opened" — some never
+      // request tiles). Bounded so a genuinely stuck load can't hang the capture.
       const deadline = Date.now() + 45000;
       await new Promise<void>((resolve) => {
         const tick = () => {
-          const s = statsRef.current;
-          const n = sceneCountRef.current;
-          if (n > 0 && s.loaded + s.failed >= n) return resolve();
+          if (settledRef.current) return resolve();
           if (Date.now() > deadline) return resolve();
-          setTimeout(tick, 250);
+          setTimeout(tick, 200);
         };
         tick();
       });
@@ -633,6 +657,7 @@ export default function App() {
         capturing={capturing}
         orbitFilter={orbitFilter}
         onOrbitFilterChange={setOrbitFilter}
+        settled={settled}
       />
     </div>
   );
@@ -1015,6 +1040,7 @@ function InfoPanel({
   capturing,
   orbitFilter,
   onOrbitFilterChange,
+  settled,
 }: {
   sceneCount: number;
   totalCount: number;
@@ -1057,6 +1083,7 @@ function InfoPanel({
   capturing: boolean;
   orbitFilter: OrbitFilter;
   onOrbitFilterChange: (o: OrbitFilter) => void;
+  settled: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
@@ -1071,7 +1098,11 @@ function InfoPanel({
   } else if (searching) {
     statusText = "searching scenes…";
   } else if (hasLoaded) {
-    statusText = `${sceneCount} ${pol.toUpperCase()} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
+    // While loading, show the live pending count; once settled, drop it (the
+    // leftover scenes simply had no tiles in view, they aren't stuck).
+    statusText = settled
+      ? `${sceneCount} ${pol.toUpperCase()} · ${stats.loaded} drawn · ${stats.failed} failed`
+      : `${sceneCount} ${pol.toUpperCase()} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
   } else if (hasSearched) {
     statusText = candidates.length
       ? `${candidates.length} candidates · ${dates.length} date${dates.length === 1 ? "" : "s"} · step and load below`
@@ -1198,7 +1229,7 @@ function InfoPanel({
         >
           {statusText}
         </div>
-        {(searching || (hasLoaded && pending > 0)) && (
+        {(searching || (hasLoaded && !settled)) && (
           <div className="s1-loadbar" style={{ marginTop: 8 }} aria-label="loading" />
         )}
         {hasLoaded && totalCount > sceneCount && !searchError && (
