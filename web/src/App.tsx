@@ -1490,20 +1490,25 @@ function InfoPanel({
               ? [
                   ["#facc15", "yellow", "vegetation / volume"],
                   ["#3b82f6", "blue", "smooth surfaces, water"],
-                  ["#d1d5db", "bright", "VV: rough / strong relief"],
+                  // Brightness is the VV luminance axis, not a hue: show a dark->bright
+                  // ramp so it reads as lightness rather than a single colour chip.
+                  ["linear-gradient(90deg, #11151a, #e5e7eb)", "bright", "VV: rough / strong relief"],
                 ]
               : [
                   ["#e06666", "R · VV", "rough ground, urban"],
                   ["#7dd37d", "G · VH", "vegetation / volume"],
                   ["#6fa8dc", "B · VV/VH", "smooth surfaces, water"],
                 ]
-            ).map(([c, k, desc]) => (
+            ).map(([c, k, desc]) => {
+              const isRamp = c.includes("gradient");
+              return (
               <div key={k} style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: UI.mono, fontSize: 11 }}>
-                <span style={{ width: 9, height: 9, borderRadius: 2, background: c, flexShrink: 0 }} />
-                <span style={{ color: UI.text, width: 64 }}>{k}</span>
+                <span style={{ width: isRamp ? 22 : 9, height: 9, borderRadius: 2, background: c, flexShrink: 0, border: isRamp ? `1px solid ${UI.hairline}` : "none" }} />
+                <span style={{ color: UI.text, width: isRamp ? 51 : 64 }}>{k}</span>
                 <span style={{ color: UI.faint }}>{desc}</span>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
