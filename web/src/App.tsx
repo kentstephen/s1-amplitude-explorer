@@ -9,7 +9,7 @@ import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
 import { type PartialSTACItem, type Polarization } from "./stac";
-import { useSceneSearch, type SceneSearch } from "./useSceneSearch";
+import { useSceneSearch, type SceneSearch, type OrbitFilter } from "./useSceneSearch";
 import { selectCoverageFirst } from "./coverage";
 import { footprintCollection } from "./footprints";
 import {
@@ -60,6 +60,36 @@ function datetimeOf(from: string, to: string): string {
   // Tolerate a reversed range (the segmented date fields don't link min/max).
   const [a, b] = from <= to ? [from, to] : [to, from];
   return `${a}T00:00:00Z/${b}T23:59:59Z`;
+}
+
+/**
+ * Build a self-describing export filename from the loaded mosaic so a folder of
+ * captures is legible at a glance: pol, look direction, the acquisition-date span
+ * actually rendered, scene count, and the map center + zoom. The browser dedupes
+ * collisions with a trailing "(1)", so no timestamp is needed.
+ *   s1-amp_VV_desc_2020-11-23..2020-12-05_30sc_27.95N_85.42E_z7.4.png
+ */
+function exportFilename(
+  map: { getCenter: () => { lat: number; lng: number }; getZoom: () => number },
+  items: PartialSTACItem[],
+  pol: Polarization,
+  orbit: OrbitFilter,
+): string {
+  const dates = items
+    .map((i) => i.datetime?.slice(0, 10))
+    .filter(Boolean)
+    .sort() as string[];
+  const span = dates.length
+    ? dates[0] === dates[dates.length - 1]
+      ? dates[0]
+      : `${dates[0]}..${dates[dates.length - 1]}`
+    : "nodate";
+  const look = orbit === "ascending" ? "asc" : orbit === "descending" ? "desc" : "both";
+  const c = map.getCenter();
+  const lat = `${Math.abs(c.lat).toFixed(2)}${c.lat >= 0 ? "N" : "S"}`;
+  const lon = `${Math.abs(c.lng).toFixed(2)}${c.lng >= 0 ? "E" : "W"}`;
+  const z = `z${map.getZoom().toFixed(1)}`;
+  return `s1-amp_${pol.toUpperCase()}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}.png`;
 }
 
 /**
@@ -132,10 +162,17 @@ export default function App() {
   // `capturing` blanks transient overlays (footprints) and the chrome while the
   // canvas is grabbed, so they aren't baked into the PNG.
   const [capturing, setCapturing] = useState(false);
+  // Orbit-direction lock. Ascending and descending light opposite slope faces, so
+  // mixing them across a wide mosaic gives the worst tonal seams; locking one
+  // direction is the cheapest way to make the frames read as one consistent scene.
+  const [orbitFilter, setOrbitFilter] = useState<OrbitFilter>(null);
   // SEARCH VIEW: candidate search + coverage selection + date stepping. Isolated
   // in a hook so a stac-map search component could drive the same surface later.
   // In export mode the "most complete" selection keeps far more scenes.
-  const search = useSceneSearch(exportMode ? EXPORT_MAX_SCENES : undefined);
+  const search = useSceneSearch({
+    maxScenes: exportMode ? EXPORT_MAX_SCENES : undefined,
+    orbit: orbitFilter,
+  });
   // Footprint coverage overlay: on after a search so you can see/step coverage,
   // off once a mosaic is loaded (so the imagery reads cleanly).
   const [previewMode, setPreviewMode] = useState(false);
@@ -400,14 +437,13 @@ export default function App() {
       const canvas = map.getCanvas();
       const url = canvas.toDataURL("image/png");
       const a = document.createElement("a");
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       a.href = url;
-      a.download = `s1-amplitude-${pol}-${stamp}.png`;
+      a.download = exportFilename(map, polItems, pol, orbitFilter);
       a.click();
     } finally {
       setCapturing(false);
     }
-  }, [pol]);
+  }, [pol, polItems, orbitFilter]);
 
   // Banded so the mesh only regenerates when the band changes, not per zoom tick.
   const meshMaxError = maxErrorForZoom(zoom);
@@ -595,6 +631,8 @@ export default function App() {
         onToggleExportMode={() => setExportMode((v) => !v)}
         onCapture={captureExport}
         capturing={capturing}
+        orbitFilter={orbitFilter}
+        onOrbitFilterChange={setOrbitFilter}
       />
     </div>
   );
@@ -975,6 +1013,8 @@ function InfoPanel({
   onToggleExportMode,
   onCapture,
   capturing,
+  orbitFilter,
+  onOrbitFilterChange,
 }: {
   sceneCount: number;
   totalCount: number;
@@ -1015,6 +1055,8 @@ function InfoPanel({
   onToggleExportMode: () => void;
   onCapture: () => void;
   capturing: boolean;
+  orbitFilter: OrbitFilter;
+  onOrbitFilterChange: (o: OrbitFilter) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
@@ -1332,7 +1374,28 @@ function InfoPanel({
             ? `Wide AOI + up to ${EXPORT_MAX_SCENES} scenes. SEARCH VIEW, LOAD, let it settle, then capture.`
             : "Off: 3-scene cap for smooth panning. Turn on to mosaic a wide range."}
         </div>
-        <div style={{ marginTop: 8 }}>
+
+        {/* Orbit lock: one look direction = consistent shading across frames */}
+        <div style={{ ...eyebrowStyle, marginTop: 11, marginBottom: 6 }}>look direction</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Toggle active={orbitFilter === null} onClick={() => onOrbitFilterChange(null)} grow
+            title="Both passes. Mixing ascending + descending flips slope shading and seams hardest.">
+            BOTH
+          </Toggle>
+          <Toggle active={orbitFilter === "ascending"} onClick={() => onOrbitFilterChange("ascending")} grow
+            title="Ascending pass only: one consistent look direction across the mosaic.">
+            ASC
+          </Toggle>
+          <Toggle active={orbitFilter === "descending"} onClick={() => onOrbitFilterChange("descending")} grow
+            title="Descending pass only: one consistent look direction across the mosaic.">
+            DESC
+          </Toggle>
+        </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6, lineHeight: 1.45 }}>
+          Lock one pass to cut the brightest seams. Re-search or re-load after changing.
+        </div>
+
+        <div style={{ marginTop: 10 }}>
           <Toggle active={capturing} onClick={onCapture} grow
             title="Wait for all scenes to finish loading, then download a PNG of the map (no UI chrome).">
             {capturing ? "CAPTURING…" : "CAPTURE PNG"}
