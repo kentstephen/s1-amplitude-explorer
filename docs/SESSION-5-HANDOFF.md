@@ -134,25 +134,34 @@ colourblind-safe). Applies to all projects now.
   add back a third perceivable dimension. Recommended (a)+(c) together. His call
   whether to replace cbSafe or add a third palette.
 - **"What is bright?"** Clarified: in cbSafe, brightness is not a colour, it is the
-  VV luminance axis (the gray legend chip signals "lightness, not a hue"). Offered to
-  relabel that legend row as a dark->bright gradient swatch; NOT done.
+  VV luminance axis. DONE in session 6: the legend row now renders a dark->bright
+  gradient ramp swatch (commit `59b32b2`).
 
 ## Remaining plan / next steps (in order)
 
 1. **~~Finish + commit the uncommitted work (6-8).~~ DONE (session 6, `ba934ab`).**
-   Typecheck + build clean. Still TODO: headless-verify culling (pan away unloads,
-   pan back reloads), MIN_ZOOM floor, and the new keybindings on a real GPU.
+   Typecheck + build clean. **Headless GPU verify DONE** via `web/verify-s6.mjs`
+   (10/10): keybindings, MIN_ZOOM floor (settles at 5), culling pan round-trip (no
+   crash), capture. Caveat: "culling" confirms no-crash + reload, not the actual
+   off-screen mesh freeing (not observable from the DOM).
 2. **~~Update the footer keyboard legend~~ DONE (session 6).** Now lists /, s,
    Enter, c, b, g, x, [ ], p, l, d.
-3. **Panel redesign (task 4, NOT started).** Stephen still wants the dashboard
-   gussied up: clearer hierarchy, less clutter, genuinely fit-to-view. The session-4
-   tidy was only spacing/footer. This is the main remaining UI task.
-4. **(Optional) Punch up cbSafe** per the ideas above.
-5. **(Optional) Relabel the "bright" legend row** as a gradient swatch.
-6. **(Optional) Per-channel composite tuning.** Today only the VV dB slider + gamma
-   drive composite; VH window tracks VV shifted down by `COMPOSITE_VH_OFFSET` (7 dB)
-   and the ratio window is fixed (`COMPOSITE_RATIO_WINDOW [2,16]`).
-7. **Merge `pol-composite` to `main`** when the above is settled.
+3. **~~Panel redesign~~ DONE (session 6, `292e909`).** Progressive disclosure:
+   Search + Coverage + Render stay always-visible; View (labels/north/marker/zoom),
+   Export, Session collapse behind a `MORE` expander; Diagnostics stays visible on
+   failure. Measured fit-to-view at 900px: tallest primary state (composite +
+   coverage) = 840px, no scroll. Only the fully-expanded MORE state scrolls.
+4. **(Optional) Punch up cbSafe** per the ideas above. STILL OPEN, his call
+   (replace cbSafe vs add a third palette; (a) saturation+floor, (c) VH as
+   saturation, blue<->orange).
+5. **~~Relabel the "bright" legend row~~ DONE (session 6, `59b32b2`).** cbSafe
+   "bright" row now renders a dark->bright gradient ramp, not a solid grey chip.
+6. **(Optional) Per-channel composite tuning.** STILL OPEN. Today only the VV dB
+   slider + gamma drive composite; VH window tracks VV shifted down by
+   `COMPOSITE_VH_OFFSET` (7 dB) and the ratio window is fixed
+   (`COMPOSITE_RATIO_WINDOW [2,16]`).
+7. **Merge `pol-composite` to `main`** when the above is settled. **Stephen will
+   trigger the merge himself (session 6 instruction: "wait on me to merge").**
 
 ## Testing notes (headless verify harness)
 
