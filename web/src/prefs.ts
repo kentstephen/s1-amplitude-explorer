@@ -11,7 +11,7 @@
  * starting AOI or camera); `App` substitutes its own defaults when a field is
  * null, so this stays free of a circular import.
  */
-import { DEFAULT_DB_RANGE, DEFAULT_GAMMA } from "./renderPipeline";
+import { DEFAULT_DB_RANGE, DEFAULT_GAMMA, type RenderMode, type CompositePalette } from "./renderPipeline";
 import type { Polarization } from "./stac";
 
 // v4: full session settings (look + search window + AOI + view). Supersedes the
@@ -27,6 +27,8 @@ export type SavedView = {
 export type Settings = {
   // Render look.
   pol: Polarization;
+  renderMode: RenderMode;
+  compositePalette: CompositePalette;
   dbRange: [number, number];
   gamma: number;
   // Search window.
@@ -40,6 +42,9 @@ export type Settings = {
 
 export const DEFAULT_SETTINGS: Settings = {
   pol: "vv",
+  renderMode: "amplitude",
+  // Colourblind-safe by default (see App / polComposite.ts).
+  compositePalette: "cbSafe",
   dbRange: DEFAULT_DB_RANGE,
   gamma: DEFAULT_GAMMA,
   dateFrom: null,
@@ -86,6 +91,8 @@ export function loadSettings(): Settings {
     const r = Array.isArray(p.dbRange) ? p.dbRange : DEFAULT_DB_RANGE;
     return {
       pol: p.pol === "vh" ? "vh" : "vv",
+      renderMode: p.renderMode === "composite" ? "composite" : "amplitude",
+      compositePalette: p.compositePalette === "natural" ? "natural" : "cbSafe",
       dbRange: [num(r[0], DEFAULT_DB_RANGE[0]), num(r[1], DEFAULT_DB_RANGE[1])],
       gamma: num(p.gamma, DEFAULT_GAMMA),
       dateFrom: isDate(p.dateFrom) ? p.dateFrom : null,

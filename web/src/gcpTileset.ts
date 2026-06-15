@@ -121,9 +121,25 @@ export class GcpTilesetLevel implements RasterTilesetLevel {
     this.metersPerPixel = Math.sqrt(Math.abs(degPerPxX * degPerPxY)) * MPU_DEGREE;
   }
 
-  /** Level pixel → full-resolution pixel (the GCP grid's coordinate space). */
+  /**
+   * Level pixel → full-resolution pixel (the GCP grid's coordinate space).
+   *
+   * Pixel-CENTER convention, so every overview level registers to the full-res
+   * grid and to each other. An overview pixel is the decimation of an f×f block
+   * of full-res pixels; its CENTRE corresponds to that block's centre, at full-res
+   * `(px + 0.5) * scale - 0.5`, NOT its top-left corner (`px * scale`). With the
+   * old corner form each coarser level (bigger `scale`) landed ~half an overview-
+   * pixel off, so the imagery shifted as you crossed zoom/overview levels and the
+   * tile seams between mixed levels misregistered (the "seam moves with zoom").
+   * Full-res (scale = 1) is unchanged: `(px + 0.5)*1 - 0.5 = px`.
+   */
   private toFull(px: number, py: number): [number, number] {
-    return [px * this.scaleX, py * this.scaleY];
+    return [(px + 0.5) * this.scaleX - 0.5, (py + 0.5) * this.scaleY - 0.5];
+  }
+
+  /** Inverse of {@link toFull}: full-resolution pixel → this level's pixel. */
+  private fromFull(fx: number, fy: number): [number, number] {
+    return [(fx + 0.5) / this.scaleX - 0.5, (fy + 0.5) / this.scaleY - 0.5];
   }
 
   projectedTileCorners(col: number, row: number): Corners {
@@ -156,7 +172,8 @@ export class GcpTilesetLevel implements RasterTilesetLevel {
       // source CRS (lon/lat) → tile pixel
       inverseTransform: (lon, lat) => {
         const [fx, fy] = inverse(this.grid, lon, lat);
-        return [fx / this.scaleX - offX, fy / this.scaleY - offY];
+        const [lx, ly] = this.fromFull(fx, fy);
+        return [lx - offX, ly - offY];
       },
     };
   }
@@ -176,8 +193,8 @@ export class GcpTilesetLevel implements RasterTilesetLevel {
       inverse(this.grid, minLon, maxLat),
       inverse(this.grid, maxLon, maxLat),
     ];
-    const xs = corners.map(([fx]) => fx / this.scaleX);
-    const ys = corners.map(([, fy]) => fy / this.scaleY);
+    const xs = corners.map(([fx]) => this.fromFull(fx, 0)[0]);
+    const ys = corners.map(([, fy]) => this.fromFull(0, fy)[1]);
     const pixMinX = Math.min(...xs);
     const pixMaxX = Math.max(...xs);
     const pixMinY = Math.min(...ys);

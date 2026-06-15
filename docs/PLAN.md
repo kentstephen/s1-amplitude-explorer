@@ -115,9 +115,34 @@ bucket is CORS-open (anonymous 206, `ACAO:*`). 26117×16884 UInt16 amplitude,
 nodata 0, 6 overviews, NO affine, 210 GCPs in ModelTiepoint tag 33922.
 
 **KNOWN OPEN (next session):**
-- **Seams when zoomed in.** Each tile reprojects with its own independent mesh,
-  so adjacent tiles triangulate their shared edge slightly differently → hairline
-  cracks. Cosmetic. Proper fix = share edge vertices across tiles (deeper).
+- **Seam: thin dark diagonal, WORSE zoomed out, fades zoomed in, moves with zoom.**
+  (Reported 2026-06-13 w/ screenshot over Stockton/San Joaquin; the older note here
+  said "zoomed IN" — that was wrong, it's zoomed OUT.) Investigation 2026-06-14:
+  - **`maxError` is NOT the cause** (measured, cold-cache per value): a zoom-out
+    logs ~2.03M GCP `inverse()` calls + ~220ms main-thread stall *regardless* of
+    `maxError` (banded/4/1.5/0.75/0.25 all within noise), and grayscale is pixel-
+    identical 4 vs 0.25. An earlier "fine is 100x cheaper" reading was a cache-warm
+    sweep-order artifact. So do NOT re-tune `maxErrorForZoom` for the seam, and note
+    the bands give ~zero perf benefit either (the ~2M inverse/stall is a separate
+    zoom-out bottleneck, independent of `maxError`).
+  - **Not the composite color path:** Stephen confirms the seam shows in BOTH
+    amplitude (grayscale) and composite. That rules out the `polComposite` absolute-
+    value-step theory from `reference-s2-inherited/SEAMS.md`.
+  - **Leading hypothesis: nodata / boundless-edge-padding × overview pyramid.** Both
+    `shaders/amplitude.ts` and `shaders/polComposite.ts` `discard` where amp `<= 0`.
+    On a coarse overview, downsample-averaging near a data edge (scene silhouette or
+    the ghost-ring 0-padding from `gcp.ts padGcpGridLinear`) smears real DN with 0
+    into a thin band that's discarded (→ dark basemap) or rendered near-black.
+    Pinned to tile/scene cut lines, wider on coarse overviews → worse out, moves w/
+    zoom, both modes. NOT yet confirmed: headless repro at Stockton (metal GPU,
+    2026-06-02 3-frame mosaic) did NOT surface it strongly, so it may be date/scene-
+    specific or GPU-specific. Confirm on Stephen's machine + classify scene-edge vs
+    interior tile-edge (transparent gap vs near-black pixels) before fixing.
+  - Candidate fixes once classified: (A) clip each scene render to its valid-data
+    footprint / raise the discard floor above the downsample taper; (B) coarse
+    single-quad underlay per scene so a gap reveals same imagery, not basemap;
+    (C) re-test `refinementStrategy: "no-overlap"` for S1. Avoid the deep shared-
+    tile-grid fork unless A/B/C all fail.
 - **dB default may read dark** depending on the scene's DN range; the slider /
   DRAMATIC preset tunes it. Confirm the default window looks right per-region.
 - Zarr track is DEAD (no CORS on `objects.eodc.eu`; see MEMORY.md). Do not reopen.

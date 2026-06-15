@@ -51,9 +51,24 @@ export type SceneSearch = {
   reset: () => void;
 };
 
-export function useSceneSearch(): SceneSearch {
+/** Which orbit pass to keep. `null` = both (no look-direction lock). */
+export type OrbitFilter = "ascending" | "descending" | null;
+
+export type SceneSearchOptions = {
+  /** Optional hard cap on scenes in the "most complete" selection. Undefined
+   *  keeps `selectCoverageFirst`'s interactive default (3); export mode passes a
+   *  far higher cap so a wide AOI can mosaic many frames. */
+  maxScenes?: number;
+  /** Lock the candidate set to one orbit direction. Ascending and descending
+   *  light opposite slope faces, so mixing them in a wide mosaic gives the worst
+   *  tonal seams; locking one direction is the cheapest seam reduction. */
+  orbit?: OrbitFilter;
+};
+
+export function useSceneSearch(opts: SceneSearchOptions = {}): SceneSearch {
+  const { maxScenes, orbit = null } = opts;
   const abort = useRef<AbortController | null>(null);
-  const [candidates, setCandidates] = useState<PartialSTACItem[]>([]);
+  const [rawCandidates, setRawCandidates] = useState<PartialSTACItem[]>([]);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
@@ -70,7 +85,7 @@ export function useSceneSearch(): SceneSearch {
       fetchStacItems({ datetime, bbox, maxItems: CANDIDATE_LIMIT, signal: ac.signal })
         .then(({ items }) => {
           if (ac.signal.aborted) return;
-          setCandidates(items);
+          setRawCandidates(items);
           setDateIdx(0);
           console.info(`[search] ${items.length} S1 GRD candidate scenes`);
         })
@@ -78,7 +93,7 @@ export function useSceneSearch(): SceneSearch {
           if (err.name !== "AbortError") {
             console.error("[search] failed:", err);
             setError(String(err.message ?? err));
-            setCandidates([]);
+            setRawCandidates([]);
           }
         })
         .finally(() => {
@@ -88,8 +103,18 @@ export function useSceneSearch(): SceneSearch {
     [],
   );
 
+  // Apply the orbit-direction lock before any grouping, so the date stepper, the
+  // coverage selection, and the footprint overlay all reflect a single look.
+  const candidates = useMemo(
+    () => (orbit ? rawCandidates.filter((c) => c.orbit === orbit) : rawCandidates),
+    [rawCandidates, orbit],
+  );
+
   const dates = useMemo(() => groupByDate(candidates), [candidates]);
-  const selection = useMemo(() => selectCoverageFirst(candidates), [candidates]);
+  const selection = useMemo(
+    () => selectCoverageFirst(candidates, { maxScenes }),
+    [candidates, maxScenes],
+  );
   const current = dates[dateIdx] ?? null;
 
   const step = useCallback(
@@ -100,7 +125,7 @@ export function useSceneSearch(): SceneSearch {
 
   const reset = useCallback(() => {
     abort.current?.abort();
-    setCandidates([]);
+    setRawCandidates([]);
     setHasSearched(false);
     setError(null);
     setDateIdx(0);

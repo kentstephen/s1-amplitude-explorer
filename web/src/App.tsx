@@ -9,7 +9,7 @@ import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
 import { type PartialSTACItem, type Polarization } from "./stac";
-import { useSceneSearch, type SceneSearch } from "./useSceneSearch";
+import { useSceneSearch, type SceneSearch, type OrbitFilter } from "./useSceneSearch";
 import { selectCoverageFirst } from "./coverage";
 import { footprintCollection } from "./footprints";
 import {
@@ -24,7 +24,9 @@ import { PlaceSearch } from "./PlaceSearch";
 import { GcpMultiCOGLayer } from "./GcpMultiCOGLayer";
 import {
   AMP_COMPOSITE,
+  POL_COMPOSITE,
   buildRenderPipeline,
+  buildCompositePipeline,
   DB_MAX,
   DB_MIN,
   DEFAULT_DB_RANGE,
@@ -32,6 +34,8 @@ import {
   DRAMATIC_DB_RANGE,
   DRAMATIC_GAMMA,
   POLARIZATIONS,
+  type RenderMode,
+  type CompositePalette,
 } from "./renderPipeline";
 
 // Aconcagua / central Andes: steep relief, the canonical dramatic-SAR demo.
@@ -51,6 +55,57 @@ function datetimeOf(from: string, to: string): string {
   // Tolerate a reversed range (the segmented date fields don't link min/max).
   const [a, b] = from <= to ? [from, to] : [to, from];
   return `${a}T00:00:00Z/${b}T23:59:59Z`;
+}
+
+/** Min interactive zoom. Below this every loaded scene piles into one coarse
+ *  overview tile at once (N full-scene reprojection meshes on the main thread),
+ *  which is the zoom-out freeze. It's also below where 10 m S1 imagery says
+ *  anything. So we floor the camera here. */
+const MIN_ZOOM = 5;
+
+/** Max interactive zoom = maplibre-gl's hard ceiling (24). NOT an LOD cap on the
+ *  imagery: it just stops the camera running past what the renderer supports, so
+ *  the raster keeps refining/holding instead of dropping out at extreme zoom. */
+const MAX_ZOOM = 24;
+
+/** Do two [W,S,E,N] bboxes overlap? Used to cull scenes outside the view. */
+function bboxIntersects(
+  a: [number, number, number, number],
+  b: [number, number, number, number],
+): boolean {
+  return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+}
+
+/**
+ * Build a self-describing export filename from the loaded mosaic so a folder of
+ * captures is legible at a glance: pol, look direction, the acquisition-date span
+ * actually rendered, scene count, and the map center + zoom. The browser dedupes
+ * collisions with a trailing "(1)", so no timestamp is needed.
+ *   s1-amp_VV_desc_2020-11-23..2020-12-05_30sc_27.95N_85.42E_z7.4.png
+ */
+function exportFilename(
+  map: { getCenter: () => { lat: number; lng: number }; getZoom: () => number },
+  items: PartialSTACItem[],
+  pol: Polarization,
+  orbit: OrbitFilter,
+  renderMode: RenderMode,
+): string {
+  const dates = items
+    .map((i) => i.datetime?.slice(0, 10))
+    .filter(Boolean)
+    .sort() as string[];
+  const span = dates.length
+    ? dates[0] === dates[dates.length - 1]
+      ? dates[0]
+      : `${dates[0]}..${dates[dates.length - 1]}`
+    : "nodate";
+  const look = orbit === "ascending" ? "asc" : orbit === "descending" ? "desc" : "both";
+  const c = map.getCenter();
+  const lat = `${Math.abs(c.lat).toFixed(2)}${c.lat >= 0 ? "N" : "S"}`;
+  const lon = `${Math.abs(c.lng).toFixed(2)}${c.lng >= 0 ? "E" : "W"}`;
+  const z = `z${map.getZoom().toFixed(1)}`;
+  const band = renderMode === "composite" ? "RGB" : pol.toUpperCase();
+  return `s1-amp_${band}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}.png`;
 }
 
 /**
@@ -106,6 +161,11 @@ export default function App() {
   const sourcesCache = useRef(new Map<string, Record<string, { url: string }>>());
   const polGen = useRef(0);
   const prevPol = useRef<Polarization | null>(null);
+  const prevMode = useRef<RenderMode | null>(null);
+  // Latest keyboard-command handlers, refreshed each render so the single mounted
+  // keydown listener never closes over stale callbacks (the handlers are defined
+  // further down; this ref is assigned once they exist).
+  const keyCmdRef = useRef<Record<string, (() => void) | undefined>>({});
   // One AbortController per generation; aborting on pol switch kills the old
   // pol's in-flight band fetches so they don't starve the new pol's requests.
   const genAbort = useRef<AbortController | null>(null);
@@ -116,9 +176,25 @@ export default function App() {
   // Loading is explicit: SEARCH finds candidates, then LOAD renders a mosaic.
   // `hasLoaded` distinguishes the idle first-run state from an empty load.
   const [hasLoaded, setHasLoaded] = useState(false);
+  // `capturing` blanks transient overlays (footprints) and the chrome while the
+  // canvas is grabbed, so they aren't baked into the PNG.
+  const [capturing, setCapturing] = useState(false);
+  // `settled` = the mosaic has stopped loading. NOT "every scene opened": at any
+  // viewport some loaded scenes never request tiles (out of view, fully
+  // overlapped), so their `onGeoTIFFLoad` never fires and the raw loaded count
+  // plateaus BELOW the scene count. Keying the load bar / capture on a full count
+  // spins forever. Instead we settle on IDLE: no new load activity for a short
+  // grace window. See the effect below.
+  const [settled, setSettled] = useState(true);
+  // Orbit-direction lock. Ascending and descending light opposite slope faces, so
+  // mixing them across a wide mosaic gives the worst tonal seams; locking one
+  // direction is the cheapest way to make the frames read as one consistent scene.
+  const [orbitFilter, setOrbitFilter] = useState<OrbitFilter>(null);
   // SEARCH VIEW: candidate search + coverage selection + date stepping. Isolated
   // in a hook so a stac-map search component could drive the same surface later.
-  const search = useSceneSearch();
+  const search = useSceneSearch({
+    orbit: orbitFilter,
+  });
   // Footprint coverage overlay: on after a search so you can see/step coverage,
   // off once a mosaic is loaded (so the imagery reads cleanly).
   const [previewMode, setPreviewMode] = useState(false);
@@ -129,6 +205,13 @@ export default function App() {
   const [pol, setPol] = useState<Polarization>(saved.pol);
   const [dbRange, setDbRange] = useState<[number, number]>(saved.dbRange);
   const [gamma, setGamma] = useState<number>(saved.gamma);
+  // Render look: single-pol grayscale amplitude (default, the headline) or the
+  // dual-pol VV/VH/ratio RGB composite. Composite needs BOTH pols of a scene.
+  const [renderMode, setRenderMode] = useState<RenderMode>(saved.renderMode);
+  // Composite palette. Default is the red-green colourblind-safe (blue↔yellow +
+  // luminance) mapping, not the standard R=VV/G=VH false colour, which is the
+  // worst case for a red-green dichromat. Natural RGB is one click away.
+  const [compositePalette, setCompositePalette] = useState<CompositePalette>(saved.compositePalette);
 
   // Device is initialized by the deck overlay; kept for parity / future GPU work.
   const [, setDevice] = useState<Device | null>(null);
@@ -142,6 +225,17 @@ export default function App() {
   const [drawing, setDrawing] = useState(false);
   const [stats, setStats] = useState<LoadStats>({ loaded: 0, failed: 0, failures: [] });
   const [zoom, setZoom] = useState<number>(8);
+  // Zoom sampled only when a gesture ENDS, used solely to band the mesh maxError.
+  // Decoupled from the live `zoom` (which drives the readout and updates every
+  // onMove tick): the reprojection mesh rebuilds SYNCHRONOUSLY on the main thread
+  // whenever maxError changes, so re-banding mid-zoom rebuilt every visible tile's
+  // mesh on each tick, stalling the frame (the "image vanishes mid zoom-in /
+  // sluggish zoom-out"). Settling it on move-end rebuilds once, after the gesture.
+  const [meshZoom, setMeshZoom] = useState<number>(8);
+  // Current view bbox (margin-expanded), refreshed on move-end. Scenes whose
+  // footprint falls outside it are dropped from the mosaic, so panning away frees
+  // their meshes/textures (they reload on return). Null = no cull yet (first load).
+  const [viewBounds, setViewBounds] = useState<[number, number, number, number] | null>(null);
   // Bumped on every manual fetch. Folded into the layer ids so the MosaicLayer
   // (and its inner TileLayer) remounts and re-traverses each fetch. Without it a
   // FETCH VIEW that doesn't move the viewport never reloads: TileLayer only
@@ -163,6 +257,8 @@ export default function App() {
     const c = map?.getCenter();
     saveSettings({
       pol,
+      renderMode,
+      compositePalette,
       dbRange,
       gamma,
       dateFrom,
@@ -172,12 +268,14 @@ export default function App() {
     });
     setSavedFlash("saved");
     setTimeout(() => setSavedFlash(""), 1400);
-  }, [pol, dbRange, gamma, dateFrom, dateTo, bbox]);
+  }, [pol, renderMode, compositePalette, dbRange, gamma, dateFrom, dateTo, bbox]);
 
   // RESET: clear saved settings and return the look + search window to defaults.
   const handleResetSettings = useCallback(() => {
     resetSettings();
     setPol(DEFAULT_SETTINGS.pol);
+    setRenderMode(DEFAULT_SETTINGS.renderMode);
+    setCompositePalette(DEFAULT_SETTINGS.compositePalette);
     setDbRange(DEFAULT_SETTINGS.dbRange);
     setGamma(DEFAULT_SETTINGS.gamma);
     setDateFrom(DEFAULT_DATE_FROM);
@@ -186,8 +284,9 @@ export default function App() {
     setTimeout(() => setSavedFlash(""), 1400);
   }, []);
 
-  // Keyboard shortcuts. Letter keys ignored while typing; `/` search, `p` swap
-  // polarization, `l` labels, `d` draw AOI, `m` marker.
+  // Keyboard shortcuts (mounted once; action handlers dispatched via keyCmdRef so
+  // they're never stale). Ignored while typing in a field. Left/right arrows step
+  // coverage dates unless the map is focused (then they pan). See the footer legend.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -198,11 +297,48 @@ export default function App() {
           t.tagName === "SELECT" ||
           t.isContentEditable);
       if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      const cmd = keyCmdRef.current;
       switch (e.key.toLowerCase()) {
         case "/":
           e.preventDefault();
           searchRef.current?.focus();
           break;
+        case "s": // search THIS view
+          e.preventDefault();
+          cmd.searchView?.();
+          break;
+        case "enter": // load the most-complete mosaic for the current search
+          e.preventDefault();
+          cmd.loadMost?.();
+          break;
+        case "c": // toggle amplitude <-> composite
+          cmd.toggleMode?.();
+          break;
+        case "b": // toggle composite palette (cb-safe / natural)
+          cmd.togglePalette?.();
+          break;
+        case "g": // grab a PNG of the current view
+          cmd.capture?.();
+          break;
+        case "[": // step coverage date back
+          cmd.stepPrev?.();
+          break;
+        case "]": // step coverage date forward
+          cmd.stepNext?.();
+          break;
+        case "arrowleft": // step coverage date back (unless the map is focused)
+        case "arrowright": {
+          // Arrows pan the map ONLY when the map is "selected" (its container has
+          // focus, i.e. you clicked it). Otherwise they drive the date stepper, so
+          // browsing dates needs no mouse. No candidates loaded => fall through to
+          // the map's default (a no-op when the map isn't focused).
+          const onMap = !!t?.closest?.(".maplibregl-map");
+          if (onMap || !cmd.canStep?.()) break;
+          e.preventDefault();
+          if (e.key === "ArrowLeft") cmd.stepPrev?.();
+          else cmd.stepNext?.();
+          break;
+        }
         case "p":
           setPol((v) => (v === "vv" ? "vh" : "vv"));
           break;
@@ -226,11 +362,14 @@ export default function App() {
     ? "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
     : "https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json";
 
-  // Bump a generation on pol change so the layer ids change, forcing deck.gl to
-  // unmount the old pol's tiles instead of leaving stale fetching tiles behind.
-  if (prevPol.current !== pol) {
+  // Bump a generation on pol OR render-mode change so the layer ids change,
+  // forcing deck.gl to unmount the old tiles instead of leaving stale fetching
+  // tiles behind. A mode switch also changes which COGs each scene opens (one pol
+  // vs both), so the sources cache must be cleared too.
+  if (prevPol.current !== pol || prevMode.current !== renderMode) {
     if (prevPol.current !== null) polGen.current += 1;
     prevPol.current = pol;
+    prevMode.current = renderMode;
     sourcesCache.current.clear();
     genAbort.current?.abort();
     genAbort.current = new AbortController();
@@ -239,8 +378,8 @@ export default function App() {
   const gen = polGen.current;
   const genSignal = genAbort.current.signal;
 
-  // Fresh scoreboard on pol switch (layers remount and reload under the new pol).
-  useEffect(() => resetStats(), [pol]);
+  // Fresh scoreboard on pol / mode switch (layers remount and reload).
+  useEffect(() => resetStats(), [pol, renderMode]);
 
   /**
    * Load a chosen set of scenes into the mosaic (the render step). Separate from
@@ -303,7 +442,8 @@ export default function App() {
   // LOAD only the date currently stepped to. Route through selectCoverageFirst so
   // a date with many overlapping frames still respects the scene cap.
   const handleLoadThisDate = () => {
-    if (search.current) loadItems(selectCoverageFirst(search.current.items).items);
+    if (search.current)
+      loadItems(selectCoverageFirst(search.current.items).items);
   };
 
   const handleResetNorth = () => {
@@ -330,70 +470,248 @@ export default function App() {
     setGamma(DRAMATIC_GAMMA);
   };
 
-  // Only scenes carrying the selected polarization can render in this mode.
+  // Scenes that can render under the current look: amplitude needs the selected
+  // pol; the composite needs BOTH pols (it maps VV+VH to colour).
   const polItems = useMemo(
-    () => stacItems.filter((it) => it.assets[pol]),
-    [stacItems, pol],
+    () =>
+      renderMode === "composite"
+        ? stacItems.filter((it) => it.assets.vv && it.assets.vh)
+        : stacItems.filter((it) => it.assets[pol]),
+    [stacItems, pol, renderMode],
   );
 
-  // Banded so the mesh only regenerates when the band changes, not per zoom tick.
-  const meshMaxError = maxErrorForZoom(zoom);
+  // Cull to the current view: only scenes whose footprint intersects the (margin-
+  // expanded) viewport are handed to the mosaic, so off-screen meshes aren't built
+  // or held. This is the "only show what's in view" perf lever for zoom-out / pan.
+  const renderItems = useMemo(
+    () => (viewBounds ? polItems.filter((it) => bboxIntersects(it.bbox, viewBounds)) : polItems),
+    [polItems, viewBounds],
+  );
+
+  // Live mirrors for the capture settle-wait (which runs outside React's render
+  // cycle and needs the latest values without re-subscribing).
+  const settledRef = useRef(settled);
+  settledRef.current = settled;
+  // Settle-cycle gating: a cycle (and the load bar) starts only when `fetchGen`
+  // bumps (an explicit load), not on the renderItems/stats churn that panning's
+  // scene cull produces. See the settle effect below.
+  const loadActiveRef = useRef(false);
+  const prevFetchGen = useRef(fetchGen);
+
+  // IDLE settle: re-arm a short timer on every load-count change; when the counts
+  // stop moving (or all scenes that will load have), mark the mosaic settled. The
+  // first scene gets a long grace (a big synchronous mesh build can stall the main
+  // thread for seconds before the count first moves); once scenes are flowing, a
+  // short idle window ends the load. This is what stops the load bar spinning when
+  // some scenes never request tiles.
+  useEffect(() => {
+    if (!hasLoaded) return;
+    // Only a fresh LOAD (fetchGen bumped) starts a settle cycle / shows the bar.
+    // Panning re-culls scenes (renderItems + stats churn as they remount and
+    // re-report), but that's not a load, so it must NOT re-spin the bar.
+    if (prevFetchGen.current !== fetchGen) {
+      prevFetchGen.current = fetchGen;
+      loadActiveRef.current = true;
+      setSettled(false);
+    }
+    if (!loadActiveRef.current) return;
+    const done = stats.loaded + stats.failed;
+    const pending = renderItems.length - done;
+    if (renderItems.length > 0 && pending <= 0) {
+      loadActiveRef.current = false;
+      setSettled(true);
+      return;
+    }
+    const idleMs = done > 0 ? 3500 : 12000;
+    const id = window.setTimeout(() => {
+      loadActiveRef.current = false;
+      setSettled(true);
+    }, idleMs);
+    return () => clearTimeout(id);
+  }, [fetchGen, stats, hasLoaded, renderItems.length]);
+
+  /**
+   * EXPORT a PNG of exactly what's on the map (no UI: the panel and marker are
+   * HTML, not canvas, so they're never in the grab; the footprint overlay is
+   * dropped via `capturing`). Waits for the mosaic to settle, then reads the
+   * canvas.
+   *
+   * The catch: react-map-gl does not forward `preserveDrawingBuffer`, so the GL
+   * drawing buffer is cleared as soon as the JS task yields after a paint. A plain
+   * `toDataURL()` (which we reach via awaits) therefore returns a BLANK frame. The
+   * fix is to read SYNCHRONOUSLY inside maplibre's `render` event, in the same task
+   * as the draw, before the buffer is cleared. Deck renders interleaved into that
+   * same pass, so the basemap + amplitude/composite are both captured.
+   */
+  const captureExport = useCallback(async () => {
+    const map = mapRef.current?.getMap();
+    if (!map || renderItems.length === 0) return;
+    setCapturing(true);
+    try {
+      // Wait for the mosaic to settle (idle, not "every scene opened" — some never
+      // request tiles). Bounded so a genuinely stuck load can't hang the capture.
+      const deadline = Date.now() + 45000;
+      await new Promise<void>((resolve) => {
+        const tick = () => {
+          if (settledRef.current) return resolve();
+          if (Date.now() > deadline) return resolve();
+          setTimeout(tick, 200);
+        };
+        tick();
+      });
+      // Let the last tiles/meshes finish painting before the grab.
+      await new Promise<void>((r) => setTimeout(() => r(), 400));
+      // Grab inside the render event (synchronous, pre-buffer-clear).
+      const url = await new Promise<string>((resolve) => {
+        const grab = () => resolve(map.getCanvas().toDataURL("image/png"));
+        map.once("render", grab);
+        map.triggerRepaint();
+        // Fallback if no render fires (e.g. nothing changed): force one read.
+        setTimeout(() => {
+          map.off("render", grab);
+          resolve(map.getCanvas().toDataURL("image/png"));
+        }, 1200);
+      });
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = exportFilename(map, renderItems, pol, orbitFilter, renderMode);
+      a.click();
+    } finally {
+      setCapturing(false);
+    }
+  }, [pol, renderItems, orbitFilter, renderMode]);
+
+  // Wire the keyboard commands to the current handlers (read by the mounted
+  // keydown listener via keyCmdRef). Reassigned every render so they're current.
+  keyCmdRef.current = {
+    searchView: handleSearchViewport,
+    loadMost: handleLoadMostComplete,
+    toggleMode: () => setRenderMode((m) => (m === "amplitude" ? "composite" : "amplitude")),
+    togglePalette: () => setCompositePalette((p) => (p === "cbSafe" ? "natural" : "cbSafe")),
+    capture: captureExport,
+    stepPrev: () => search.step(-1),
+    stepNext: () => search.step(1),
+    canStep: () => search.dates.length > 1,
+  };
+
+  // Refresh the cull bbox from the map, expanded by a half-viewport margin so
+  // scenes just off-screen stay loaded (no reload on a small pan). Called on
+  // move-end and on load.
+  const updateViewBounds = useCallback((map: {
+    getBounds: () => { getWest(): number; getSouth(): number; getEast(): number; getNorth(): number };
+  }) => {
+    const b = map.getBounds();
+    const w = b.getWest(), s = b.getSouth(), e = b.getEast(), n = b.getNorth();
+    const mx = (e - w) * 0.5;
+    const my = (n - s) * 0.5;
+    setViewBounds([w - mx, s - my, e + mx, n + my]);
+  }, []);
+
+  // Banded off the settled (move-end) zoom, not the live one, so the mesh only
+  // regenerates after a gesture ends, not on every zoom tick.
+  const meshMaxError = maxErrorForZoom(meshZoom);
 
   const layers = useMemo(() => {
-    if (polItems.length === 0) return [];
-    const pipeline = buildRenderPipeline({ dbRange, gamma });
+    if (renderItems.length === 0) return [];
+    const composite = renderMode === "composite";
+    // One pipeline + composite mapping per look: grayscale dB amplitude (single
+    // `amp` slot) or the dual-pol VV/VH/ratio RGB composite (vv + vh slots).
+    const pipeline = composite
+      ? buildCompositePipeline({ vvWindow: dbRange, gamma, palette: compositePalette })
+      : buildRenderPipeline({ dbRange, gamma });
+    const bandComposite = composite ? POL_COMPOSITE : AMP_COMPOSITE;
 
-    const mosaic = new MosaicLayer<PartialSTACItem, null>({
-      id: `s1-mosaic-${pol}-${gen}-${fetchGen}`,
-      sources: polItems,
-      maxCacheSize: 0,
-      // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
-      // item's bbox for spatial indexing.
-      getSource: async () => null,
-      renderSource: (source) => {
-        const href = source.assets[pol]?.href;
-        if (!href) return null;
-        const cacheKey = `${pol}-${source.id}`;
+    // Resolve a STAC item to the COG source record (and the scoreboard key),
+    // reused by both the detail layer and the coarse underlay so they open the
+    // identical sources object (MultiCOGLayer resets if `sources` !== old).
+    const resolveSources = (source: PartialSTACItem) => {
+      const vvHref = source.assets.vv?.href;
+      const vhHref = source.assets.vh?.href;
+      if (composite) {
+        if (!vvHref || !vhHref) return null;
+        const cacheKey = `comp-${source.id}`;
         let sources = sourcesCache.current.get(cacheKey);
         if (!sources) {
-          sources = { amp: { url: href } };
+          sources = { vv: { url: vvHref }, vh: { url: vhHref } };
           sourcesCache.current.set(cacheKey, sources);
         }
-        return new GcpMultiCOGLayer({
-          id: `s1-multi-${pol}-${gen}-${fetchGen}-${source.id}`,
-          sources,
-          composite: AMP_COMPOSITE,
-          renderPipeline: pipeline,
-          signal: genSignal,
-          refinementStrategy: "best-available",
-          // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
-          // reprojection mesh looks identical to a fine one but builds far fewer
-          // triangles and calls the (heavier) GCP inverse far fewer times.
-          // Banded by viewport zoom (maxErrorForZoom): loose on wide views where
-          // sub-pixel mesh accuracy is invisible, fine on detail zooms.
-          maxError: meshMaxError,
-          // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
-          // concurrency so a wide view doesn't stampede range reads.
-          maxRequests: 10,
-          onGeoTIFFLoad: () => reportLoaded(href),
-          onError: (e: unknown) =>
-            reportFailed(href, e instanceof Error ? e.message : String(e)),
-          updateTriggers: {
-            renderTile: [pol, dbRange[0], dbRange[1], gamma],
-          },
-        } as any);
-      },
-      // @ts-expect-error beforeId is injected by @deck.gl/mapbox
-      beforeId: labelBeforeId,
-    });
-    return [mosaic];
-  }, [polItems, labelBeforeId, pol, gen, fetchGen, dbRange, gamma, meshMaxError]);
+        return { sources, sceneHref: vvHref };
+      }
+      const sceneHref = source.assets[pol]?.href;
+      if (!sceneHref) return null;
+      const cacheKey = `${pol}-${source.id}`;
+      let sources = sourcesCache.current.get(cacheKey);
+      if (!sources) {
+        sources = { amp: { url: sceneHref } };
+        sourcesCache.current.set(cacheKey, sources);
+      }
+      return { sources, sceneHref };
+    };
+
+    // `underlay`: render ONLY the coarsest overview (maxZoom: 0 caps the level
+    // index, see raster-tileset-2d). That's one gap-free mesh per scene drawn
+    // BENEATH the tiled detail layer, so the hairline cracks between the detail
+    // layer's independently-reprojected tiles reveal the same imagery (a touch
+    // soft) instead of the dark basemap. Same pipeline → the seam disappears.
+    // The underlay doesn't tally the load scoreboard (the detail layer does) so
+    // counts aren't doubled.
+    const makeSceneLayer = (source: PartialSTACItem, underlay: boolean) => {
+      const resolved = resolveSources(source);
+      if (!resolved) return null;
+      const { sources, sceneHref } = resolved;
+      const tag = underlay ? "under" : "multi";
+      return new GcpMultiCOGLayer({
+        id: `s1-${tag}-${renderMode}-${pol}-${gen}-${fetchGen}-${source.id}`,
+        sources,
+        composite: bandComposite,
+        renderPipeline: pipeline,
+        signal: genSignal,
+        refinementStrategy: "best-available",
+        ...(underlay ? { maxZoom: 0 } : {}),
+        // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
+        // reprojection mesh looks identical to a fine one but builds far fewer
+        // triangles and calls the (heavier) GCP inverse far fewer times.
+        // Banded by viewport zoom (maxErrorForZoom): loose on wide views where
+        // sub-pixel mesh accuracy is invisible, fine on detail zooms.
+        maxError: meshMaxError,
+        // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
+        // concurrency so a wide view doesn't stampede range reads.
+        maxRequests: 10,
+        ...(underlay
+          ? {}
+          : {
+              onGeoTIFFLoad: () => reportLoaded(sceneHref),
+              onError: (e: unknown) =>
+                reportFailed(sceneHref, e instanceof Error ? e.message : String(e)),
+            }),
+        updateTriggers: {
+          renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma, compositePalette],
+        },
+      } as any);
+    };
+
+    const mosaic = (underlay: boolean) =>
+      new MosaicLayer<PartialSTACItem, null>({
+        id: `s1-mosaic${underlay ? "-under" : ""}-${renderMode}-${pol}-${gen}-${fetchGen}`,
+        sources: renderItems,
+        maxCacheSize: 0,
+        // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
+        // item's bbox for spatial indexing.
+        getSource: async () => null,
+        renderSource: (source) => makeSceneLayer(source, underlay),
+        // @ts-expect-error beforeId is injected by @deck.gl/mapbox
+        beforeId: labelBeforeId,
+      });
+
+    // Underlay first (drawn below), then the tiled detail layer on top.
+    return [mosaic(true), mosaic(false)];
+  }, [renderItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
   // the "most complete" selection dim-teal, the rest faint. Sits above the
   // raster, below labels. Only while previewing (cleared once a mosaic loads).
   const footprintLayer = useMemo(() => {
-    if (!previewMode || search.candidates.length === 0) return null;
+    if (!previewMode || capturing || search.candidates.length === 0) return null;
     const activeIds = new Set((search.current?.items ?? []).map((i) => i.id));
     const selectedIds = new Set(search.selection.items.map((i) => i.id));
     const data = footprintCollection(search.candidates, activeIds, selectedIds);
@@ -420,7 +738,7 @@ export default function App() {
       },
       beforeId: labelBeforeId,
     } as any);
-  }, [previewMode, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
+  }, [previewMode, capturing, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
 
   const allLayers = useMemo(
     () => (footprintLayer ? [...layers, footprintLayer] : layers),
@@ -440,12 +758,19 @@ export default function App() {
       <MaplibreMap
         ref={mapRef}
         initialViewState={initialViewState}
-        minZoom={3}
+        minZoom={MIN_ZOOM}
+        maxZoom={MAX_ZOOM}
         onMove={(e) => setZoom(e.viewState.zoom)}
+        onMoveEnd={(e) => {
+          updateViewBounds(e.target);
+          setMeshZoom(e.viewState.zoom);
+        }}
         attributionControl={false}
         mapStyle={mapStyle}
         onLoad={(e) => {
           const map = e.target;
+          updateViewBounds(map);
+          setMeshZoom(map.getZoom());
           const ls = map.getStyle()?.layers ?? [];
           const firstSymbol = ls.find((l: any) => l.type === "symbol");
           setLabelBeforeId(firstSymbol?.id);
@@ -491,6 +816,10 @@ export default function App() {
         onLoadThisDate={handleLoadThisDate}
         pol={pol}
         onPolChange={setPol}
+        renderMode={renderMode}
+        onRenderModeChange={setRenderMode}
+        compositePalette={compositePalette}
+        onCompositePaletteChange={setCompositePalette}
         dbRange={dbRange}
         onDbRangeChange={setDbRange}
         gamma={gamma}
@@ -514,6 +843,11 @@ export default function App() {
         onResetSettings={handleResetSettings}
         savedFlash={savedFlash}
         zoom={zoom}
+        onCapture={captureExport}
+        capturing={capturing}
+        orbitFilter={orbitFilter}
+        onOrbitFilterChange={setOrbitFilter}
+        settled={settled}
       />
     </div>
   );
@@ -539,7 +873,7 @@ const eyebrowStyle: React.CSSProperties = {
   letterSpacing: "0.14em",
   textTransform: "uppercase",
   color: UI.faint,
-  marginBottom: 8,
+  marginBottom: 6,
 };
 
 function Section({
@@ -554,13 +888,65 @@ function Section({
   return (
     <div
       style={{
-        marginTop: first ? 10 : 11,
-        paddingTop: first ? 0 : 10,
+        marginTop: first ? 8 : 9,
+        paddingTop: first ? 0 : 8,
         borderTop: first ? "none" : `1px solid ${UI.hairline}`,
       }}
     >
       <div style={eyebrowStyle}>{label}</div>
       {children}
+    </div>
+  );
+}
+
+/**
+ * Collapsible folder: a clickable header that shows/hides its children. Replaces
+ * the old Find/Look/View tab bar so every group lives on one scrolling page and
+ * more than one can be open at a time.
+ */
+function Group({
+  label,
+  children,
+  defaultOpen,
+}: {
+  label: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div
+      style={{
+        marginTop: 9,
+        paddingTop: 9,
+        borderTop: `1px solid ${UI.hairline}`,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          fontFamily: UI.mono,
+          fontSize: 12,
+          fontWeight: 600,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+          color: open ? UI.accent : UI.text,
+        }}
+      >
+        <span style={{ width: 10, color: UI.mute, fontSize: 10 }}>{open ? "▾" : "▸"}</span>
+        {label}
+      </button>
+      {open && <div>{children}</div>}
     </div>
   );
 }
@@ -867,6 +1253,10 @@ function InfoPanel({
   onLoadThisDate,
   pol,
   onPolChange,
+  renderMode,
+  onRenderModeChange,
+  compositePalette,
+  onCompositePaletteChange,
   dbRange,
   onDbRangeChange,
   gamma,
@@ -890,6 +1280,11 @@ function InfoPanel({
   onResetSettings,
   savedFlash,
   zoom,
+  onCapture,
+  capturing,
+  orbitFilter,
+  onOrbitFilterChange,
+  settled,
 }: {
   sceneCount: number;
   totalCount: number;
@@ -903,6 +1298,10 @@ function InfoPanel({
   onLoadThisDate: () => void;
   pol: Polarization;
   onPolChange: (p: Polarization) => void;
+  renderMode: RenderMode;
+  onRenderModeChange: (m: RenderMode) => void;
+  compositePalette: CompositePalette;
+  onCompositePaletteChange: (p: CompositePalette) => void;
   dbRange: [number, number];
   onDbRangeChange: (r: [number, number]) => void;
   gamma: number;
@@ -926,12 +1325,18 @@ function InfoPanel({
   onResetSettings: () => void;
   savedFlash: "" | "saved" | "reset";
   zoom: number;
+  onCapture: () => void;
+  capturing: boolean;
+  orbitFilter: OrbitFilter;
+  onOrbitFilterChange: (o: OrbitFilter) => void;
+  settled: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
   const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
 
+  const bandLabel = renderMode === "composite" ? "VV+VH" : pol.toUpperCase();
   let statusText: string;
   let statusColor: string = UI.mute;
   if (searchError) {
@@ -940,7 +1345,11 @@ function InfoPanel({
   } else if (searching) {
     statusText = "searching scenes…";
   } else if (hasLoaded) {
-    statusText = `${sceneCount} ${pol.toUpperCase()} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
+    // While loading, show the live pending count; once settled, drop it (the
+    // leftover scenes simply had no tiles in view, they aren't stuck).
+    statusText = settled
+      ? `${sceneCount} ${bandLabel} · ${stats.loaded} drawn · ${stats.failed} failed`
+      : `${sceneCount} ${bandLabel} loaded · ${stats.loaded} ok · ${stats.failed} failed · ${pending} pending`;
   } else if (hasSearched) {
     statusText = candidates.length
       ? `${candidates.length} candidates · ${dates.length} date${dates.length === 1 ? "" : "s"} · step and load below`
@@ -995,7 +1404,7 @@ function InfoPanel({
         width: 324,
         maxHeight: "calc(100vh - 28px)",
         overflowY: "auto",
-        padding: "14px 16px 12px",
+        padding: "12px 16px 0",
         background: "linear-gradient(180deg, rgba(15,19,25,0.82), rgba(10,13,18,0.78))",
         backdropFilter: "blur(14px)",
         WebkitBackdropFilter: "blur(14px)",
@@ -1040,7 +1449,10 @@ function InfoPanel({
         </div>
       </div>
 
-      {/* Search: place, date window, search action, view toggles */}
+      {/* Collapsible folders (Find / Look / View) stacked on one scrolling page.
+          Each opens independently; Find is open by default. */}
+      <Group label="Find" defaultOpen>
+      {/* Search: place, date window, look direction, search action */}
       <Section label="Search" first>
         <PlaceSearch ref={searchRef} onPick={onPickPlace} />
         <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
@@ -1048,6 +1460,26 @@ function InfoPanel({
           <span style={{ color: UI.faint }}>→</span>
           <DateField value={dateTo} onChange={onDateToChange} ariaLabel="end date" />
         </div>
+
+        {/* Orbit / look direction: scopes the search. One pass = consistent slope
+            shading across the mosaic; BOTH mixes ascending + descending (seams
+            hardest). Re-search or re-load after changing. */}
+        <div style={{ ...eyebrowStyle, marginTop: 11, marginBottom: 6 }}>look direction</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Toggle active={orbitFilter === null} onClick={() => onOrbitFilterChange(null)} grow
+            title="Both passes. Mixing ascending + descending flips slope shading and seams hardest.">
+            BOTH
+          </Toggle>
+          <Toggle active={orbitFilter === "ascending"} onClick={() => onOrbitFilterChange("ascending")} grow
+            title="Ascending pass only: one consistent look direction across the mosaic.">
+            ASC
+          </Toggle>
+          <Toggle active={orbitFilter === "descending"} onClick={() => onOrbitFilterChange("descending")} grow
+            title="Descending pass only: one consistent look direction across the mosaic.">
+            DESC
+          </Toggle>
+        </div>
+
         <div style={{ marginTop: 9, display: "flex", gap: 6 }}>
           <Toggle active={searching} onClick={onSearchViewport} grow
             title="Find Sentinel-1 scenes over the current view for this date window">
@@ -1067,30 +1499,14 @@ function InfoPanel({
         >
           {statusText}
         </div>
-        {(searching || (hasLoaded && pending > 0)) && (
+        {(searching || (hasLoaded && !settled)) && (
           <div className="s1-loadbar" style={{ marginTop: 8 }} aria-label="loading" />
         )}
         {hasLoaded && totalCount > sceneCount && !searchError && (
           <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 3 }}>
-            ({totalCount - sceneCount} loaded scenes lack {pol.toUpperCase()})
+            ({totalCount - sceneCount} loaded scenes lack {renderMode === "composite" ? "both pols" : pol.toUpperCase()})
           </div>
         )}
-        <div style={{ marginTop: 9, display: "flex", flexWrap: "wrap", gap: 6 }}>
-          <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
-            LABELS {labels ? "ON" : "OFF"}
-          </Toggle>
-          <Toggle active={false} onClick={onResetNorth} title="Reset to north-up, flat">
-            NORTH ↑
-          </Toggle>
-          {hasMarker && (
-            <Toggle active={showMarker} onClick={onToggleMarker}>
-              {showMarker ? "HIDE MARKER" : "SHOW MARKER"}
-            </Toggle>
-          )}
-        </div>
-        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
-          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
-        </div>
       </Section>
 
       {/* Coverage: step through candidate mosaics, load the most complete or one date */}
@@ -1139,21 +1555,82 @@ function InfoPanel({
           </div>
         </Section>
       )}
+      </Group>
 
-      {/* Render: polarization + dB stretch + gamma + colormap */}
-      <Section label="Amplitude">
+      <Group label="Look">
+      {/* Render: mode + (pol) + dB stretch + gamma. Amplitude = single-pol
+          grayscale; Composite = dual-pol VV/VH/ratio false colour. */}
+      <Section label={renderMode === "composite" ? "Composite" : "Amplitude"} first>
+        {/* Mode switch */}
         <div style={{ display: "flex", gap: 6 }}>
-          {POLARIZATIONS.map((p) => (
-            <Toggle key={p} active={pol === p} onClick={() => onPolChange(p)} grow
-              title={p === "vv" ? "Co-pol: cleanest terrain / surface look" : "Cross-pol: volume scattering (vegetation, rough)"}>
-              {p.toUpperCase()}
-            </Toggle>
-          ))}
+          <Toggle active={renderMode === "amplitude"} onClick={() => onRenderModeChange("amplitude")} grow
+            title="Single polarization, grayscale dB. The dramatic relief / texture look.">
+            AMPLITUDE
+          </Toggle>
+          <Toggle active={renderMode === "composite"} onClick={() => onRenderModeChange("composite")} grow
+            title="Dual-pol false colour: R=VV, G=VH, B=VV/VH ratio. Needs both pols of a scene.">
+            COMPOSITE
+          </Toggle>
         </div>
+
+        {/* Polarization: amplitude mode only (composite uses both) */}
+        {renderMode === "amplitude" && (
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            {POLARIZATIONS.map((p) => (
+              <Toggle key={p} active={pol === p} onClick={() => onPolChange(p)} grow
+                title={p === "vv" ? "Co-pol: cleanest terrain / surface look" : "Cross-pol: volume scattering (vegetation, rough)"}>
+                {p.toUpperCase()}
+              </Toggle>
+            ))}
+          </div>
+        )}
+
+        {/* Composite palette: colourblind-safe (default) vs natural R/G/B */}
+        {renderMode === "composite" && (
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <Toggle active={compositePalette === "cbSafe"} onClick={() => onCompositePaletteChange("cbSafe")} grow
+              title="Red-green colourblind-safe: VV→brightness, VV/VH ratio→blue↔yellow.">
+              CB-SAFE
+            </Toggle>
+            <Toggle active={compositePalette === "natural"} onClick={() => onCompositePaletteChange("natural")} grow
+              title="Standard S1 false colour: R=VV, G=VH, B=VV/VH ratio.">
+              NATURAL
+            </Toggle>
+          </div>
+        )}
+
+        {/* Composite legend: what the colours mean (the learning bit), per palette */}
+        {renderMode === "composite" && (
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
+            {(compositePalette === "cbSafe"
+              ? [
+                  ["#facc15", "yellow", "vegetation / volume"],
+                  ["#3b82f6", "blue", "smooth surfaces, water"],
+                  // Brightness is the VV luminance axis, not a hue: show a dark->bright
+                  // ramp so it reads as lightness rather than a single colour chip.
+                  ["linear-gradient(90deg, #11151a, #e5e7eb)", "bright", "VV: rough / strong relief"],
+                ]
+              : [
+                  ["#e06666", "R · VV", "rough ground, urban"],
+                  ["#7dd37d", "G · VH", "vegetation / volume"],
+                  ["#6fa8dc", "B · VV/VH", "smooth surfaces, water"],
+                ]
+            ).map(([c, k, desc]) => {
+              const isRamp = c.includes("gradient");
+              return (
+              <div key={k} style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: UI.mono, fontSize: 11 }}>
+                <span style={{ width: isRamp ? 22 : 9, height: 9, borderRadius: 2, background: c, flexShrink: 0, border: isRamp ? `1px solid ${UI.hairline}` : "none" }} />
+                <span style={{ color: UI.text, width: isRamp ? 51 : 64 }}>{k}</span>
+                <span style={{ color: UI.faint }}>{desc}</span>
+              </div>
+              );
+            })}
+          </div>
+        )}
 
         <div
           style={{
-            marginTop: 10,
+            marginTop: 9,
             padding: "9px 11px 11px",
             border: `1px solid ${UI.hairline}`,
             borderRadius: 8,
@@ -1161,13 +1638,16 @@ function InfoPanel({
           }}
         >
           <div style={{ ...eyebrowStyle, color: UI.accent, letterSpacing: "0.1em", marginBottom: 2 }}>
-            {pol.toUpperCase()} · dB stretch
+            {renderMode === "composite" ? "VV/VH · dB stretch" : `${pol.toUpperCase()} · dB stretch`}
           </div>
 
-          {/* dB window (two-way stretch) */}
+          {/* dB window (two-way stretch). In composite mode this is the VV window;
+              VH tracks it shifted down, the ratio window is fixed. */}
           <div style={{ marginTop: 8 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ fontFamily: UI.mono, fontSize: 12, color: UI.mute }}>dB range</span>
+              <span style={{ fontFamily: UI.mono, fontSize: 12, color: UI.mute }}>
+                {renderMode === "composite" ? "VV dB" : "dB range"}
+              </span>
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <NumBox
                   value={dbRange[0]}
@@ -1229,6 +1709,43 @@ function InfoPanel({
           */}
         </div>
       </Section>
+      </Group>
+
+      <Group label="View">
+      {/* View: labels, north reset, marker, live zoom readout */}
+      <Section label="View" first>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
+            LABELS {labels ? "ON" : "OFF"}
+          </Toggle>
+          <Toggle active={false} onClick={onResetNorth} title="Reset to north-up, flat">
+            NORTH ↑
+          </Toggle>
+          {hasMarker && (
+            <Toggle active={showMarker} onClick={onToggleMarker}>
+              {showMarker ? "HIDE MARKER" : "SHOW MARKER"}
+            </Toggle>
+          )}
+        </div>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
+          zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
+        </div>
+      </Section>
+
+      {/* Export: grab a PNG of the current map */}
+      <Section label="Export">
+        <div>
+          <Toggle active={capturing} onClick={onCapture} grow
+            title="Wait for all scenes to finish loading, then download a PNG of the map (no UI chrome).">
+            {capturing ? "CAPTURING…" : "CAPTURE PNG"}
+          </Toggle>
+        </div>
+        {sceneCount === 0 && (
+          <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6 }}>
+            Load a mosaic first; capture grabs what's on the map.
+          </div>
+        )}
+      </Section>
 
       {/* Session: persist the look + search window + AOI + map view */}
       <Section label="Session">
@@ -1246,6 +1763,7 @@ function InfoPanel({
           Saves look, dates, AOI &amp; view to this browser.
         </div>
       </Section>
+      </Group>
 
       {/* Diagnostics: only when something failed to load */}
       {stats.failures.length > 0 && (
@@ -1304,39 +1822,44 @@ function InfoPanel({
         </Section>
       )}
 
-      {/* Footer: provenance */}
+      {/* Footer: keyboard hints + condensed provenance */}
       <div
         style={{
-          marginTop: 10,
-          paddingTop: 9,
+          marginTop: 9,
+          paddingTop: 8,
           borderTop: `1px solid ${UI.hairline}`,
           fontFamily: UI.mono,
           fontSize: 11,
-          lineHeight: 1.45,
+          lineHeight: 1.4,
         }}
       >
-        <div style={{ color: UI.faint }}>
-          <span style={{ color: UI.mute }}>/</span> search&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>P</span> pol&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>L</span> labels&nbsp;&nbsp;
-          <span style={{ color: UI.mute }}>D</span> draw
-        </div>
-        <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ color: UI.faint, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+          <span style={{ display: "flex", flexWrap: "wrap", columnGap: 10, rowGap: 3 }}>
+            <span><span style={{ color: UI.mute }}>/</span> search</span>
+            <span><span style={{ color: UI.mute }}>S</span> this view</span>
+            <span><span style={{ color: UI.mute }}>⏎</span> load</span>
+            <span><span style={{ color: UI.mute }}>C</span> composite</span>
+            <span><span style={{ color: UI.mute }}>B</span> palette</span>
+            <span><span style={{ color: UI.mute }}>G</span> grab PNG</span>
+            <span><span style={{ color: UI.mute }}>[ ] ←→</span> date</span>
+            <span><span style={{ color: UI.mute }}>P</span> pol</span>
+            <span><span style={{ color: UI.mute }}>L</span> labels</span>
+            <span><span style={{ color: UI.mute }}>D</span> draw</span>
+          </span>
           <a
             href="https://github.com/kentstephen/s1-amplitude-explorer"
             target="_blank"
             rel="noreferrer"
             title="This project's source on GitHub"
-            style={{ color: UI.mute, display: "inline-flex", alignItems: "center", gap: 5, textDecoration: "none" }}
+            style={{ color: UI.mute, display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none" }}
           >
-            <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
             </svg>
-            View source
+            source
           </a>
         </div>
-        <div style={{ color: UI.faint, marginTop: 4 }}>
-          Data:{" "}
+        <div style={{ color: UI.faint, marginTop: 5 }}>
           <a
             href="https://registry.opendata.aws/sentinel-1/"
             target="_blank"
@@ -1346,10 +1869,7 @@ function InfoPanel({
           >
             Sentinel-1 GRD
           </a>{" "}
-          via Earth Search (AWS Open Data), GCP-warped in the browser
-        </div>
-        <div style={{ color: UI.faint, marginTop: 4 }}>
-          Built with{" "}
+          · Earth Search · GCP-warped via{" "}
           <a
             href="https://developmentseed.org/deck.gl-raster/"
             target="_blank"
@@ -1357,10 +1877,13 @@ function InfoPanel({
             style={{ color: UI.mute, textDecoration: "underline" }}
           >
             deck.gl-raster
-          </a>{" "}
-          by Development Seed
+          </a>
         </div>
       </div>
+      {/* Real bottom gap as flow content: a scroll container's padding-bottom is
+          dropped by WebKit when content overflows, so the last line would bleed
+          into the rounded edge. A spacer reserves the gap in every engine. */}
+      <div aria-hidden style={{ height: 12 }} />
     </div>
   );
 }
