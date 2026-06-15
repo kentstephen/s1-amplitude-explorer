@@ -1478,7 +1478,7 @@ function InfoPanel({
             textTransform: "uppercase",
           }}
         >
-          Sentinel-1 <span style={{ color: UI.accent }}>Amplitude</span>
+          Sentinel-1 <span style={{ color: UI.accent }}>Explorer</span>
         </div>
       </div>
 

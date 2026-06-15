@@ -1,4 +1,4 @@
-# Sentinel-1 Amplitude Explorer
+# Sentinel-1 Explorer
 
 Browser-side rendering of **Sentinel-1 SAR amplitude** as dramatic monochrome
 imagery over mountain ranges and deserts, using Development Seed's
