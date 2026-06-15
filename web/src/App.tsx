@@ -19,7 +19,7 @@ import {
   subscribeStats,
 } from "./loadStats";
 import { resultToBbox, type GeoResult } from "./geocode";
-import { loadSettings, saveSettings, resetSettings, DEFAULT_SETTINGS } from "./prefs";
+import { loadSettings, saveSettings, resetSettings, hasSavedSettings, DEFAULT_SETTINGS } from "./prefs";
 import { PlaceSearch } from "./PlaceSearch";
 import { GcpMultiCOGLayer } from "./GcpMultiCOGLayer";
 import {
@@ -38,15 +38,18 @@ import {
   type CompositePalette,
 } from "./renderPipeline";
 
-// Aconcagua / central Andes: steep relief, the canonical dramatic-SAR demo.
-// Tight AOI so the first warp renders one well-understood GRD scene.
-const DEFAULT_BBOX: [number, number, number, number] = [-70.3, -32.9, -69.8, -32.5];
-// ~1-week window ending on the verified Andes VV/VH IW GRD scene (2026-06-05;
-// see docs/PLAN.md, S1A_IW_GRDH_1SDV_20260605T232821...). A week (not a single
-// day) so FETCH VIEW finds an overpass after you pan elsewhere; the load stays
-// bounded by maxItems regardless of how many scenes the window contains.
-const DEFAULT_DATE_FROM = "2026-05-30";
-const DEFAULT_DATE_TO = "2026-06-05";
+// Lena River Delta, Siberia: braided channels over frozen tundra, the dramatic
+// winter-SAR demo. Tight AOI so the first warp renders one well-understood scene.
+const DEFAULT_BBOX: [number, number, number, number] = [126.2, 71.89, 130.03, 73.13];
+// Winter window (frozen delta, strongest channel/relief contrast). Wide enough
+// that FETCH VIEW finds an overpass after you pan; the load stays bounded by
+// maxItems regardless of how many scenes the window contains.
+const DEFAULT_DATE_FROM = "2017-11-01";
+const DEFAULT_DATE_TO = "2018-03-01";
+// Fresh visit (no saved session): auto-search the default AOI and load this date
+// so the app opens straight onto a SAR mosaic, not a bare basemap. Falls back to
+// the most-complete mosaic if no overpass lands on this exact date.
+const AUTOLOAD_DATE = "2018-01-31";
 // Ceiling for the "fetch viewport" AOI span (deg/axis) so a zoomed-out view
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
@@ -125,8 +128,13 @@ function maxErrorForZoom(zoom: number): number {
   // already displaces by hundreds of m), so a 1-2px mesh error is invisible while
   // roughly halving triangle count vs sub-pixel. Snappiness > sub-pixel fidelity.
   if (zoom >= 9) return 1.5;
-  if (zoom >= 7) return 4;
-  if (zoom >= 5) return 10;
+  // z7-9: high-latitude GRD frames (e.g. the Lena delta at ~72N) warp harder than
+  // a 4px mesh can approximate, so the refiner bailed at ~36px and left the two
+  // frames misregistered (the seam). A looser 12px target actually converges, so
+  // adjacent frames register and the seam mostly closes; the warp is smooth so the
+  // extra mesh error stays invisible.
+  if (zoom >= 7) return 12;
+  if (zoom >= 5) return 14;
   return 24;
 }
 
@@ -202,6 +210,9 @@ export default function App() {
   // Saved session settings (look + search window + AOI + view). Seeds all the
   // state below; falls back to the app defaults for any field left unsaved.
   const saved = useRef(loadSettings()).current;
+  // Auto-load the default scene only on a fresh visit (no saved session). Cleared
+  // once the search resolves and we've loaded (or given up), so it never re-fires.
+  const autoload = useRef(!hasSavedSettings());
   const [pol, setPol] = useState<Polarization>(saved.pol);
   const [dbRange, setDbRange] = useState<[number, number]>(saved.dbRange);
   const [gamma, setGamma] = useState<number>(saved.gamma);
@@ -445,6 +456,28 @@ export default function App() {
     if (search.current)
       loadItems(selectCoverageFirst(search.current.items).items);
   };
+
+  // Fresh visit: kick off the default-AOI search once on mount. The result effect
+  // below loads the target date when candidates arrive.
+  useEffect(() => {
+    if (autoload.current) runSearch(DEFAULT_BBOX);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // When the auto-load search resolves, load the target date (or the most-complete
+  // mosaic if no overpass lands on it), then disarm so it never re-fires.
+  useEffect(() => {
+    if (!autoload.current || search.searching || !search.hasSearched) return;
+    autoload.current = false;
+    if (!search.dates.length) return; // empty result: leave the basemap up
+    const idx = search.dates.findIndex((d) => d.date === AUTOLOAD_DATE);
+    if (idx < 0) {
+      loadItems(search.selection.items);
+      return;
+    }
+    search.setDateIdx(idx);
+    loadItems(selectCoverageFirst(search.dates[idx].items).items);
+  }, [search.searching, search.hasSearched, search.dates, search.selection, search.setDateIdx, loadItems]);
 
   const handleResetNorth = () => {
     mapRef.current?.getMap()?.easeTo({ bearing: 0, pitch: 0, duration: 400 });
@@ -746,9 +779,9 @@ export default function App() {
   );
 
   const initialViewState = {
-    longitude: saved.view?.longitude ?? -70.05,
-    latitude: saved.view?.latitude ?? -32.7,
-    zoom: saved.view?.zoom ?? 10,
+    longitude: saved.view?.longitude ?? 127.82,
+    latitude: saved.view?.latitude ?? 72.55,
+    zoom: saved.view?.zoom ?? 7.7,
     pitch: 0,
     bearing: 0,
   };
