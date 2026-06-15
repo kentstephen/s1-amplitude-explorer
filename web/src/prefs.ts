@@ -42,9 +42,8 @@ export type Settings = {
 
 export const DEFAULT_SETTINGS: Settings = {
   pol: "vv",
-  renderMode: "amplitude",
-  // Colourblind-safe by default (see App / polComposite.ts).
-  compositePalette: "cbSafe",
+  renderMode: "composite",
+  compositePalette: "natural",
   dbRange: DEFAULT_DB_RANGE,
   gamma: DEFAULT_GAMMA,
   dateFrom: null,
@@ -102,6 +101,15 @@ export function loadSettings(): Settings {
     };
   } catch {
     return DEFAULT_SETTINGS;
+  }
+}
+
+/** True when a saved session exists (so a fresh visit can auto-load a default). */
+export function hasSavedSettings(): boolean {
+  try {
+    return localStorage.getItem(KEY) != null;
+  } catch {
+    return false;
   }
 }
 
