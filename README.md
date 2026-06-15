@@ -6,6 +6,8 @@ imagery over mountain ranges and deserts, using Development Seed's
 data, no hosting: the browser opens each Cloud-Optimized GeoTIFF over HTTP Range
 and renders it client-side.
 
+**Live demo:** https://kentstephen.github.io/s1-amplitude-explorer/
+
 > Status: **scaffold**. Forked from
 > [`sentinel-2-cog-deckgl-raster`](https://github.com/kentstephen/sentinel-2-cog-deckgl-raster)
 > (the two-way-slider COG/STAC app), with the Sentinel-2 spectral pipeline and

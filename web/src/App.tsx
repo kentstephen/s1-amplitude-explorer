@@ -51,15 +51,6 @@ const DEFAULT_DATE_TO = "2026-06-05";
 // can't enumerate hundreds of ~700 MB COGs.
 const MAX_VIEWPORT_SPAN_DEG = 3.0;
 
-// EXPORT MODE caps. The interactive caps above are tuned for smooth panning
-// (each scene is one full-scene reprojection mesh built SYNCHRONOUSLY on the main
-// thread, so a low scene count keeps zoom-out responsive). A still capture does
-// not pan: we load once, let it settle, and grab the canvas. So export mode trades
-// interactivity for coverage, lifting both the AOI span and the scene cap far
-// enough to mosaic a wide range (e.g. the full Caucasus, ~10 deg, ~10-15 frames).
-const EXPORT_MAX_VIEWPORT_SPAN_DEG = 14.0;
-const EXPORT_MAX_SCENES = 30;
-
 function datetimeOf(from: string, to: string): string {
   // Tolerate a reversed range (the segmented date fields don't link min/max).
   const [a, b] = from <= to ? [from, to] : [to, from];
@@ -71,6 +62,11 @@ function datetimeOf(from: string, to: string): string {
  *  which is the zoom-out freeze. It's also below where 10 m S1 imagery says
  *  anything. So we floor the camera here. */
 const MIN_ZOOM = 5;
+
+/** Max interactive zoom = maplibre-gl's hard ceiling (24). NOT an LOD cap on the
+ *  imagery: it just stops the camera running past what the renderer supports, so
+ *  the raster keeps refining/holding instead of dropping out at extreme zoom. */
+const MAX_ZOOM = 24;
 
 /** Do two [W,S,E,N] bboxes overlap? Used to cull scenes outside the view. */
 function bboxIntersects(
@@ -180,10 +176,6 @@ export default function App() {
   // Loading is explicit: SEARCH finds candidates, then LOAD renders a mosaic.
   // `hasLoaded` distinguishes the idle first-run state from an empty load.
   const [hasLoaded, setHasLoaded] = useState(false);
-  // EXPORT MODE: lifts the interactive scene/span caps so a wide AOI can mosaic
-  // many frames for a still capture (load once, settle, grab the canvas). Off by
-  // default so normal browsing stays smooth.
-  const [exportMode, setExportMode] = useState(false);
   // `capturing` blanks transient overlays (footprints) and the chrome while the
   // canvas is grabbed, so they aren't baked into the PNG.
   const [capturing, setCapturing] = useState(false);
@@ -191,8 +183,8 @@ export default function App() {
   // viewport some loaded scenes never request tiles (out of view, fully
   // overlapped), so their `onGeoTIFFLoad` never fires and the raw loaded count
   // plateaus BELOW the scene count. Keying the load bar / capture on a full count
-  // spins forever (worst in export mode, with many scenes). Instead we settle on
-  // IDLE: no new load activity for a short grace window. See the effect below.
+  // spins forever. Instead we settle on IDLE: no new load activity for a short
+  // grace window. See the effect below.
   const [settled, setSettled] = useState(true);
   // Orbit-direction lock. Ascending and descending light opposite slope faces, so
   // mixing them across a wide mosaic gives the worst tonal seams; locking one
@@ -200,9 +192,7 @@ export default function App() {
   const [orbitFilter, setOrbitFilter] = useState<OrbitFilter>(null);
   // SEARCH VIEW: candidate search + coverage selection + date stepping. Isolated
   // in a hook so a stac-map search component could drive the same surface later.
-  // In export mode the "most complete" selection keeps far more scenes.
   const search = useSceneSearch({
-    maxScenes: exportMode ? EXPORT_MAX_SCENES : undefined,
     orbit: orbitFilter,
   });
   // Footprint coverage overlay: on after a search so you can see/step coverage,
@@ -235,6 +225,13 @@ export default function App() {
   const [drawing, setDrawing] = useState(false);
   const [stats, setStats] = useState<LoadStats>({ loaded: 0, failed: 0, failures: [] });
   const [zoom, setZoom] = useState<number>(8);
+  // Zoom sampled only when a gesture ENDS, used solely to band the mesh maxError.
+  // Decoupled from the live `zoom` (which drives the readout and updates every
+  // onMove tick): the reprojection mesh rebuilds SYNCHRONOUSLY on the main thread
+  // whenever maxError changes, so re-banding mid-zoom rebuilt every visible tile's
+  // mesh on each tick, stalling the frame (the "image vanishes mid zoom-in /
+  // sluggish zoom-out"). Settling it on move-end rebuilds once, after the gesture.
+  const [meshZoom, setMeshZoom] = useState<number>(8);
   // Current view bbox (margin-expanded), refreshed on move-end. Scenes whose
   // footprint falls outside it are dropped from the mosaic, so panning away frees
   // their meshes/textures (they reload on return). Null = no cull yet (first load).
@@ -288,8 +285,8 @@ export default function App() {
   }, []);
 
   // Keyboard shortcuts (mounted once; action handlers dispatched via keyCmdRef so
-  // they're never stale). Ignored while typing in a field. Avoids arrow keys (the
-  // map pans with those). See the footer for the live legend.
+  // they're never stale). Ignored while typing in a field. Left/right arrows step
+  // coverage dates unless the map is focused (then they pan). See the footer legend.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -323,15 +320,25 @@ export default function App() {
         case "g": // grab a PNG of the current view
           cmd.capture?.();
           break;
-        case "x": // toggle export mode
-          cmd.toggleExport?.();
-          break;
         case "[": // step coverage date back
           cmd.stepPrev?.();
           break;
         case "]": // step coverage date forward
           cmd.stepNext?.();
           break;
+        case "arrowleft": // step coverage date back (unless the map is focused)
+        case "arrowright": {
+          // Arrows pan the map ONLY when the map is "selected" (its container has
+          // focus, i.e. you clicked it). Otherwise they drive the date stepper, so
+          // browsing dates needs no mouse. No candidates loaded => fall through to
+          // the map's default (a no-op when the map isn't focused).
+          const onMap = !!t?.closest?.(".maplibregl-map");
+          if (onMap || !cmd.canStep?.()) break;
+          e.preventDefault();
+          if (e.key === "ArrowLeft") cmd.stepPrev?.();
+          else cmd.stepNext?.();
+          break;
+        }
         case "p":
           setPol((v) => (v === "vv" ? "vh" : "vv"));
           break;
@@ -424,8 +431,7 @@ export default function App() {
     w -= dw; e += dw; s -= dh; n += dh;
     const cx = (w + e) / 2;
     const cy = (s + n) / 2;
-    const spanCap = exportMode ? EXPORT_MAX_VIEWPORT_SPAN_DEG : MAX_VIEWPORT_SPAN_DEG;
-    const maxHalf = spanCap / 2;
+    const maxHalf = MAX_VIEWPORT_SPAN_DEG / 2;
     const halfW = Math.min((e - w) / 2, maxHalf);
     const halfH = Math.min((n - s) / 2, maxHalf);
     runSearch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
@@ -437,11 +443,7 @@ export default function App() {
   // a date with many overlapping frames still respects the scene cap.
   const handleLoadThisDate = () => {
     if (search.current)
-      loadItems(
-        selectCoverageFirst(search.current.items, {
-          maxScenes: exportMode ? EXPORT_MAX_SCENES : undefined,
-        }).items,
-      );
+      loadItems(selectCoverageFirst(search.current.items).items);
   };
 
   const handleResetNorth = () => {
@@ -490,6 +492,11 @@ export default function App() {
   // cycle and needs the latest values without re-subscribing).
   const settledRef = useRef(settled);
   settledRef.current = settled;
+  // Settle-cycle gating: a cycle (and the load bar) starts only when `fetchGen`
+  // bumps (an explicit load), not on the renderItems/stats churn that panning's
+  // scene cull produces. See the settle effect below.
+  const loadActiveRef = useRef(false);
+  const prevFetchGen = useRef(fetchGen);
 
   // IDLE settle: re-arm a short timer on every load-count change; when the counts
   // stop moving (or all scenes that will load have), mark the mosaic settled. The
@@ -499,17 +506,29 @@ export default function App() {
   // some scenes never request tiles.
   useEffect(() => {
     if (!hasLoaded) return;
+    // Only a fresh LOAD (fetchGen bumped) starts a settle cycle / shows the bar.
+    // Panning re-culls scenes (renderItems + stats churn as they remount and
+    // re-report), but that's not a load, so it must NOT re-spin the bar.
+    if (prevFetchGen.current !== fetchGen) {
+      prevFetchGen.current = fetchGen;
+      loadActiveRef.current = true;
+      setSettled(false);
+    }
+    if (!loadActiveRef.current) return;
     const done = stats.loaded + stats.failed;
     const pending = renderItems.length - done;
     if (renderItems.length > 0 && pending <= 0) {
+      loadActiveRef.current = false;
       setSettled(true);
       return;
     }
-    setSettled(false);
     const idleMs = done > 0 ? 3500 : 12000;
-    const id = window.setTimeout(() => setSettled(true), idleMs);
+    const id = window.setTimeout(() => {
+      loadActiveRef.current = false;
+      setSettled(true);
+    }, idleMs);
     return () => clearTimeout(id);
-  }, [stats, hasLoaded, renderItems.length]);
+  }, [fetchGen, stats, hasLoaded, renderItems.length]);
 
   /**
    * EXPORT a PNG of exactly what's on the map (no UI: the panel and marker are
@@ -570,9 +589,9 @@ export default function App() {
     toggleMode: () => setRenderMode((m) => (m === "amplitude" ? "composite" : "amplitude")),
     togglePalette: () => setCompositePalette((p) => (p === "cbSafe" ? "natural" : "cbSafe")),
     capture: captureExport,
-    toggleExport: () => setExportMode((v) => !v),
     stepPrev: () => search.step(-1),
     stepNext: () => search.step(1),
+    canStep: () => search.dates.length > 1,
   };
 
   // Refresh the cull bbox from the map, expanded by a half-viewport margin so
@@ -588,8 +607,9 @@ export default function App() {
     setViewBounds([w - mx, s - my, e + mx, n + my]);
   }, []);
 
-  // Banded so the mesh only regenerates when the band changes, not per zoom tick.
-  const meshMaxError = maxErrorForZoom(zoom);
+  // Banded off the settled (move-end) zoom, not the live one, so the mesh only
+  // regenerates after a gesture ends, not on every zoom tick.
+  const meshMaxError = maxErrorForZoom(meshZoom);
 
   const layers = useMemo(() => {
     if (renderItems.length === 0) return [];
@@ -601,69 +621,90 @@ export default function App() {
       : buildRenderPipeline({ dbRange, gamma });
     const bandComposite = composite ? POL_COMPOSITE : AMP_COMPOSITE;
 
-    const mosaic = new MosaicLayer<PartialSTACItem, null>({
-      id: `s1-mosaic-${renderMode}-${pol}-${gen}-${fetchGen}`,
-      sources: renderItems,
-      maxCacheSize: 0,
-      // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
-      // item's bbox for spatial indexing.
-      getSource: async () => null,
-      renderSource: (source) => {
-        // Amplitude opens one pol's COG; composite opens both (same scene, same
-        // GCP grid, so they're pixel-aligned). `sceneHref` is the dedupe key for
-        // the load scoreboard (one tally per scene, not per band).
-        const vvHref = source.assets.vv?.href;
-        const vhHref = source.assets.vh?.href;
-        let sources: Record<string, { url: string }> | undefined;
-        let sceneHref: string | undefined;
-        if (composite) {
-          if (!vvHref || !vhHref) return null;
-          sceneHref = vvHref;
-          const cacheKey = `comp-${source.id}`;
-          sources = sourcesCache.current.get(cacheKey);
-          if (!sources) {
-            sources = { vv: { url: vvHref }, vh: { url: vhHref } };
-            sourcesCache.current.set(cacheKey, sources);
-          }
-        } else {
-          sceneHref = source.assets[pol]?.href;
-          if (!sceneHref) return null;
-          const cacheKey = `${pol}-${source.id}`;
-          sources = sourcesCache.current.get(cacheKey);
-          if (!sources) {
-            sources = { amp: { url: sceneHref } };
-            sourcesCache.current.set(cacheKey, sources);
-          }
+    // Resolve a STAC item to the COG source record (and the scoreboard key),
+    // reused by both the detail layer and the coarse underlay so they open the
+    // identical sources object (MultiCOGLayer resets if `sources` !== old).
+    const resolveSources = (source: PartialSTACItem) => {
+      const vvHref = source.assets.vv?.href;
+      const vhHref = source.assets.vh?.href;
+      if (composite) {
+        if (!vvHref || !vhHref) return null;
+        const cacheKey = `comp-${source.id}`;
+        let sources = sourcesCache.current.get(cacheKey);
+        if (!sources) {
+          sources = { vv: { url: vvHref }, vh: { url: vhHref } };
+          sourcesCache.current.set(cacheKey, sources);
         }
-        const tally = sceneHref;
-        return new GcpMultiCOGLayer({
-          id: `s1-multi-${renderMode}-${pol}-${gen}-${fetchGen}-${source.id}`,
-          sources,
-          composite: bandComposite,
-          renderPipeline: pipeline,
-          signal: genSignal,
-          refinementStrategy: "best-available",
-          // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
-          // reprojection mesh looks identical to a fine one but builds far fewer
-          // triangles and calls the (heavier) GCP inverse far fewer times.
-          // Banded by viewport zoom (maxErrorForZoom): loose on wide views where
-          // sub-pixel mesh accuracy is invisible, fine on detail zooms.
-          maxError: meshMaxError,
-          // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
-          // concurrency so a wide view doesn't stampede range reads.
-          maxRequests: 10,
-          onGeoTIFFLoad: () => reportLoaded(tally),
-          onError: (e: unknown) =>
-            reportFailed(tally, e instanceof Error ? e.message : String(e)),
-          updateTriggers: {
-            renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma, compositePalette],
-          },
-        } as any);
-      },
-      // @ts-expect-error beforeId is injected by @deck.gl/mapbox
-      beforeId: labelBeforeId,
-    });
-    return [mosaic];
+        return { sources, sceneHref: vvHref };
+      }
+      const sceneHref = source.assets[pol]?.href;
+      if (!sceneHref) return null;
+      const cacheKey = `${pol}-${source.id}`;
+      let sources = sourcesCache.current.get(cacheKey);
+      if (!sources) {
+        sources = { amp: { url: sceneHref } };
+        sourcesCache.current.set(cacheKey, sources);
+      }
+      return { sources, sceneHref };
+    };
+
+    // `underlay`: render ONLY the coarsest overview (maxZoom: 0 caps the level
+    // index, see raster-tileset-2d). That's one gap-free mesh per scene drawn
+    // BENEATH the tiled detail layer, so the hairline cracks between the detail
+    // layer's independently-reprojected tiles reveal the same imagery (a touch
+    // soft) instead of the dark basemap. Same pipeline → the seam disappears.
+    // The underlay doesn't tally the load scoreboard (the detail layer does) so
+    // counts aren't doubled.
+    const makeSceneLayer = (source: PartialSTACItem, underlay: boolean) => {
+      const resolved = resolveSources(source);
+      if (!resolved) return null;
+      const { sources, sceneHref } = resolved;
+      const tag = underlay ? "under" : "multi";
+      return new GcpMultiCOGLayer({
+        id: `s1-${tag}-${renderMode}-${pol}-${gen}-${fetchGen}-${source.id}`,
+        sources,
+        composite: bandComposite,
+        renderPipeline: pipeline,
+        signal: genSignal,
+        refinementStrategy: "best-available",
+        ...(underlay ? { maxZoom: 0 } : {}),
+        // The GCP warp is smooth (bilinear over a 21x10 grid), so a coarse
+        // reprojection mesh looks identical to a fine one but builds far fewer
+        // triangles and calls the (heavier) GCP inverse far fewer times.
+        // Banded by viewport zoom (maxErrorForZoom): loose on wide views where
+        // sub-pixel mesh accuracy is invisible, fine on detail zooms.
+        maxError: meshMaxError,
+        // Raw GRD bucket is fast and CORS-open (no SAS throttle); still cap
+        // concurrency so a wide view doesn't stampede range reads.
+        maxRequests: 10,
+        ...(underlay
+          ? {}
+          : {
+              onGeoTIFFLoad: () => reportLoaded(sceneHref),
+              onError: (e: unknown) =>
+                reportFailed(sceneHref, e instanceof Error ? e.message : String(e)),
+            }),
+        updateTriggers: {
+          renderTile: [renderMode, pol, dbRange[0], dbRange[1], gamma, compositePalette],
+        },
+      } as any);
+    };
+
+    const mosaic = (underlay: boolean) =>
+      new MosaicLayer<PartialSTACItem, null>({
+        id: `s1-mosaic${underlay ? "-under" : ""}-${renderMode}-${pol}-${gen}-${fetchGen}`,
+        sources: renderItems,
+        maxCacheSize: 0,
+        // MultiCOGLayer opens its own GeoTIFFs; MosaicLayer only needs each
+        // item's bbox for spatial indexing.
+        getSource: async () => null,
+        renderSource: (source) => makeSceneLayer(source, underlay),
+        // @ts-expect-error beforeId is injected by @deck.gl/mapbox
+        beforeId: labelBeforeId,
+      });
+
+    // Underlay first (drawn below), then the tiled detail layer on top.
+    return [mosaic(true), mosaic(false)];
   }, [renderItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
@@ -718,13 +759,18 @@ export default function App() {
         ref={mapRef}
         initialViewState={initialViewState}
         minZoom={MIN_ZOOM}
+        maxZoom={MAX_ZOOM}
         onMove={(e) => setZoom(e.viewState.zoom)}
-        onMoveEnd={(e) => updateViewBounds(e.target)}
+        onMoveEnd={(e) => {
+          updateViewBounds(e.target);
+          setMeshZoom(e.viewState.zoom);
+        }}
         attributionControl={false}
         mapStyle={mapStyle}
         onLoad={(e) => {
           const map = e.target;
           updateViewBounds(map);
+          setMeshZoom(map.getZoom());
           const ls = map.getStyle()?.layers ?? [];
           const firstSymbol = ls.find((l: any) => l.type === "symbol");
           setLabelBeforeId(firstSymbol?.id);
@@ -797,8 +843,6 @@ export default function App() {
         onResetSettings={handleResetSettings}
         savedFlash={savedFlash}
         zoom={zoom}
-        exportMode={exportMode}
-        onToggleExportMode={() => setExportMode((v) => !v)}
         onCapture={captureExport}
         capturing={capturing}
         orbitFilter={orbitFilter}
@@ -851,6 +895,58 @@ function Section({
     >
       <div style={eyebrowStyle}>{label}</div>
       {children}
+    </div>
+  );
+}
+
+/**
+ * Collapsible folder: a clickable header that shows/hides its children. Replaces
+ * the old Find/Look/View tab bar so every group lives on one scrolling page and
+ * more than one can be open at a time.
+ */
+function Group({
+  label,
+  children,
+  defaultOpen,
+}: {
+  label: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div
+      style={{
+        marginTop: 9,
+        paddingTop: 9,
+        borderTop: `1px solid ${UI.hairline}`,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          fontFamily: UI.mono,
+          fontSize: 12,
+          fontWeight: 600,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+          color: open ? UI.accent : UI.text,
+        }}
+      >
+        <span style={{ width: 10, color: UI.mute, fontSize: 10 }}>{open ? "▾" : "▸"}</span>
+        {label}
+      </button>
+      {open && <div>{children}</div>}
     </div>
   );
 }
@@ -1184,8 +1280,6 @@ function InfoPanel({
   onResetSettings,
   savedFlash,
   zoom,
-  exportMode,
-  onToggleExportMode,
   onCapture,
   capturing,
   orbitFilter,
@@ -1231,8 +1325,6 @@ function InfoPanel({
   onResetSettings: () => void;
   savedFlash: "" | "saved" | "reset";
   zoom: number;
-  exportMode: boolean;
-  onToggleExportMode: () => void;
   onCapture: () => void;
   capturing: boolean;
   orbitFilter: OrbitFilter;
@@ -1240,7 +1332,6 @@ function InfoPanel({
   settled: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
-  const [showMore, setShowMore] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
   const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
@@ -1313,7 +1404,7 @@ function InfoPanel({
         width: 324,
         maxHeight: "calc(100vh - 28px)",
         overflowY: "auto",
-        padding: "12px 16px 11px",
+        padding: "12px 16px 0",
         background: "linear-gradient(180deg, rgba(15,19,25,0.82), rgba(10,13,18,0.78))",
         backdropFilter: "blur(14px)",
         WebkitBackdropFilter: "blur(14px)",
@@ -1358,7 +1449,10 @@ function InfoPanel({
         </div>
       </div>
 
-      {/* Search: place, date window, search action, view toggles */}
+      {/* Collapsible folders (Find / Look / View) stacked on one scrolling page.
+          Each opens independently; Find is open by default. */}
+      <Group label="Find" defaultOpen>
+      {/* Search: place, date window, look direction, search action */}
       <Section label="Search" first>
         <PlaceSearch ref={searchRef} onPick={onPickPlace} />
         <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
@@ -1366,6 +1460,26 @@ function InfoPanel({
           <span style={{ color: UI.faint }}>→</span>
           <DateField value={dateTo} onChange={onDateToChange} ariaLabel="end date" />
         </div>
+
+        {/* Orbit / look direction: scopes the search. One pass = consistent slope
+            shading across the mosaic; BOTH mixes ascending + descending (seams
+            hardest). Re-search or re-load after changing. */}
+        <div style={{ ...eyebrowStyle, marginTop: 11, marginBottom: 6 }}>look direction</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Toggle active={orbitFilter === null} onClick={() => onOrbitFilterChange(null)} grow
+            title="Both passes. Mixing ascending + descending flips slope shading and seams hardest.">
+            BOTH
+          </Toggle>
+          <Toggle active={orbitFilter === "ascending"} onClick={() => onOrbitFilterChange("ascending")} grow
+            title="Ascending pass only: one consistent look direction across the mosaic.">
+            ASC
+          </Toggle>
+          <Toggle active={orbitFilter === "descending"} onClick={() => onOrbitFilterChange("descending")} grow
+            title="Descending pass only: one consistent look direction across the mosaic.">
+            DESC
+          </Toggle>
+        </div>
+
         <div style={{ marginTop: 9, display: "flex", gap: 6 }}>
           <Toggle active={searching} onClick={onSearchViewport} grow
             title="Find Sentinel-1 scenes over the current view for this date window">
@@ -1441,10 +1555,12 @@ function InfoPanel({
           </div>
         </Section>
       )}
+      </Group>
 
+      <Group label="Look">
       {/* Render: mode + (pol) + dB stretch + gamma. Amplitude = single-pol
           grayscale; Composite = dual-pol VV/VH/ratio false colour. */}
-      <Section label={renderMode === "composite" ? "Composite" : "Amplitude"}>
+      <Section label={renderMode === "composite" ? "Composite" : "Amplitude"} first>
         {/* Mode switch */}
         <div style={{ display: "flex", gap: 6 }}>
           <Toggle active={renderMode === "amplitude"} onClick={() => onRenderModeChange("amplitude")} grow
@@ -1593,40 +1709,9 @@ function InfoPanel({
           */}
         </div>
       </Section>
+      </Group>
 
-      {/* Progressive disclosure: the primary path (search -> load -> look) stays
-          above; secondary controls (view toggles, export, session) collapse here. */}
-      <button
-        type="button"
-        onClick={() => setShowMore((v) => !v)}
-        style={{
-          marginTop: 9,
-          paddingTop: 9,
-          width: "100%",
-          display: "flex",
-          alignItems: "center",
-          gap: 7,
-          background: "transparent",
-          border: "none",
-          borderTop: `1px solid ${UI.hairline}`,
-          color: UI.faint,
-          cursor: "pointer",
-          ...eyebrowStyle,
-          marginBottom: 0,
-        }}
-        title={showMore ? "Hide secondary controls" : "Show view, export, and session controls"}
-      >
-        <span style={{ width: 9, color: UI.mute }}>{showMore ? "▾" : "▸"}</span>
-        <span>{showMore ? "less" : "more"}</span>
-        {!showMore && (
-          <span style={{ letterSpacing: "0.04em", textTransform: "none", color: UI.faint, fontWeight: 400 }}>
-            view · export · session
-          </span>
-        )}
-      </button>
-
-      {showMore && (
-        <>
+      <Group label="View">
       {/* View: labels, north reset, marker, live zoom readout */}
       <Section label="View" first>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -1647,41 +1732,9 @@ function InfoPanel({
         </div>
       </Section>
 
-      {/* Export: lift the interactive caps for a wide mosaic, then grab a PNG */}
+      {/* Export: grab a PNG of the current map */}
       <Section label="Export">
-        <div style={{ display: "flex", gap: 6 }}>
-          <Toggle active={exportMode} onClick={onToggleExportMode} grow
-            title="Lift the scene/AOI caps so a wide range can mosaic. Panning gets slow; that's fine for a still.">
-            EXPORT MODE {exportMode ? "ON" : "OFF"}
-          </Toggle>
-        </div>
-        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6, lineHeight: 1.45 }}>
-          {exportMode
-            ? `Wide AOI + up to ${EXPORT_MAX_SCENES} scenes. SEARCH VIEW, LOAD, let it settle, then capture.`
-            : "Off: 3-scene cap for smooth panning. Turn on to mosaic a wide range."}
-        </div>
-
-        {/* Orbit lock: one look direction = consistent shading across frames */}
-        <div style={{ ...eyebrowStyle, marginTop: 11, marginBottom: 6 }}>look direction</div>
-        <div style={{ display: "flex", gap: 6 }}>
-          <Toggle active={orbitFilter === null} onClick={() => onOrbitFilterChange(null)} grow
-            title="Both passes. Mixing ascending + descending flips slope shading and seams hardest.">
-            BOTH
-          </Toggle>
-          <Toggle active={orbitFilter === "ascending"} onClick={() => onOrbitFilterChange("ascending")} grow
-            title="Ascending pass only: one consistent look direction across the mosaic.">
-            ASC
-          </Toggle>
-          <Toggle active={orbitFilter === "descending"} onClick={() => onOrbitFilterChange("descending")} grow
-            title="Descending pass only: one consistent look direction across the mosaic.">
-            DESC
-          </Toggle>
-        </div>
-        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6, lineHeight: 1.45 }}>
-          Lock one pass to cut the brightest seams. Re-search or re-load after changing.
-        </div>
-
-        <div style={{ marginTop: 10 }}>
+        <div>
           <Toggle active={capturing} onClick={onCapture} grow
             title="Wait for all scenes to finish loading, then download a PNG of the map (no UI chrome).">
             {capturing ? "CAPTURING…" : "CAPTURE PNG"}
@@ -1710,8 +1763,7 @@ function InfoPanel({
           Saves look, dates, AOI &amp; view to this browser.
         </div>
       </Section>
-        </>
-      )}
+      </Group>
 
       {/* Diagnostics: only when something failed to load */}
       {stats.failures.length > 0 && (
@@ -1789,8 +1841,7 @@ function InfoPanel({
             <span><span style={{ color: UI.mute }}>C</span> composite</span>
             <span><span style={{ color: UI.mute }}>B</span> palette</span>
             <span><span style={{ color: UI.mute }}>G</span> grab PNG</span>
-            <span><span style={{ color: UI.mute }}>X</span> export</span>
-            <span><span style={{ color: UI.mute }}>[ ]</span> date</span>
+            <span><span style={{ color: UI.mute }}>[ ] ←→</span> date</span>
             <span><span style={{ color: UI.mute }}>P</span> pol</span>
             <span><span style={{ color: UI.mute }}>L</span> labels</span>
             <span><span style={{ color: UI.mute }}>D</span> draw</span>
@@ -1829,6 +1880,10 @@ function InfoPanel({
           </a>
         </div>
       </div>
+      {/* Real bottom gap as flow content: a scroll container's padding-bottom is
+          dropped by WebKit when content overflows, so the last line would bleed
+          into the rounded edge. A spacer reserves the gap in every engine. */}
+      <div aria-hidden style={{ height: 12 }} />
     </div>
   );
 }
