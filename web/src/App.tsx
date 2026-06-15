@@ -247,6 +247,16 @@ export default function App() {
   // footprint falls outside it are dropped from the mosaic, so panning away frees
   // their meshes/textures (they reload on return). Null = no cull yet (first load).
   const [viewBounds, setViewBounds] = useState<[number, number, number, number] | null>(null);
+  // True once the map has moved since the last search, so the loaded coverage no
+  // longer matches the view. Drives a "SEARCH VIEW to refresh" hint on the panel.
+  const [movedSinceSearch, setMovedSinceSearch] = useState(false);
+  // Does the current view still overlap any searched candidate footprint? If you
+  // pan off the coverage there's nothing here to render, so the LOAD buttons are
+  // disabled until you SEARCH VIEW again over the new view.
+  const viewInCoverage = useMemo(() => {
+    if (!viewBounds) return true; // no cull computed yet (first load)
+    return search.candidates.some((c) => bboxIntersects(viewBounds, c.bbox));
+  }, [viewBounds, search.candidates]);
   // Bumped on every manual fetch. Folded into the layer ids so the MosaicLayer
   // (and its inner TileLayer) remounts and re-traverses each fetch. Without it a
   // FETCH VIEW that doesn't move the viewport never reloads: TileLayer only
@@ -416,6 +426,7 @@ export default function App() {
       setBbox(targetBbox);
       setMarker(null);
       setPreviewMode(true);
+      setMovedSinceSearch(false);
       search.search(targetBbox, datetimeOf(dateFrom, dateTo));
     },
     [search, dateFrom, dateTo],
@@ -797,6 +808,7 @@ export default function App() {
         onMoveEnd={(e) => {
           updateViewBounds(e.target);
           setMeshZoom(e.viewState.zoom);
+          setMovedSinceSearch(true);
         }}
         attributionControl={false}
         mapStyle={mapStyle}
@@ -843,6 +855,8 @@ export default function App() {
         stats={stats}
         search={search}
         previewMode={previewMode}
+        movedSinceSearch={movedSinceSearch}
+        viewInCoverage={viewInCoverage}
         onTogglePreview={() => setPreviewMode((v) => !v)}
         onSearchViewport={handleSearchViewport}
         onLoadMostComplete={handleLoadMostComplete}
@@ -990,29 +1004,39 @@ function Toggle({
   children,
   title,
   grow,
+  highlight,
+  disabled,
 }: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
   title?: string;
   grow?: boolean;
+  /** Make the whole button pop with a bold amber fill (colourblind-safe, not
+   *  red/green). Used to nudge SEARCH VIEW once the map has moved since search. */
+  highlight?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
       title={title}
+      disabled={disabled}
       style={{
         flex: grow ? 1 : undefined,
         padding: "5px 11px",
         fontFamily: UI.mono,
         fontSize: 12,
+        fontWeight: highlight ? 700 : 400,
         letterSpacing: "0.04em",
         borderRadius: 4,
-        border: `1px solid ${active ? UI.accent : UI.fieldBorder}`,
-        background: active ? UI.accentDim : "transparent",
-        color: active ? UI.accent : UI.text,
-        cursor: "pointer",
+        border: `1px solid ${highlight ? "#f5a623" : active ? UI.accent : UI.fieldBorder}`,
+        background: highlight ? "#f5a623" : active ? UI.accentDim : "transparent",
+        color: highlight ? "#1a1206" : active ? UI.accent : UI.text,
+        boxShadow: highlight ? "0 0 14px rgba(245,166,35,0.6)" : "none",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.4 : 1,
         whiteSpace: "nowrap",
       }}
     >
@@ -1280,6 +1304,8 @@ function InfoPanel({
   stats,
   search,
   previewMode,
+  movedSinceSearch,
+  viewInCoverage,
   onTogglePreview,
   onSearchViewport,
   onLoadMostComplete,
@@ -1325,6 +1351,8 @@ function InfoPanel({
   stats: LoadStats;
   search: SceneSearch;
   previewMode: boolean;
+  movedSinceSearch: boolean;
+  viewInCoverage: boolean;
   onTogglePreview: () => void;
   onSearchViewport: () => void;
   onLoadMostComplete: () => void;
@@ -1514,7 +1542,7 @@ function InfoPanel({
         </div>
 
         <div style={{ marginTop: 9, display: "flex", gap: 6 }}>
-          <Toggle active={searching} onClick={onSearchViewport} grow
+          <Toggle active={searching} highlight={movedSinceSearch && hasSearched} onClick={onSearchViewport} grow
             title="Find Sentinel-1 scenes over the current view for this date window">
             {searching ? "SEARCHING…" : "SEARCH VIEW"}
           </Toggle>
@@ -1571,14 +1599,18 @@ function InfoPanel({
           </div>
 
           <div style={{ marginTop: 10 }}>
-            <Toggle active onClick={onLoadMostComplete} grow
-              title="Render the coverage-first mosaic across the whole date window">
+            <Toggle active onClick={onLoadMostComplete} grow disabled={!viewInCoverage}
+              title={viewInCoverage
+                ? "Render the coverage-first mosaic across the whole date window"
+                : "View is off the searched coverage. SEARCH VIEW here first."}>
               LOAD MOST COMPLETE
             </Toggle>
           </div>
           <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
-            <Toggle active={false} onClick={onLoadThisDate} grow
-              title="Render only the scenes from the stepped date">
+            <Toggle active={false} onClick={onLoadThisDate} grow disabled={!viewInCoverage}
+              title={viewInCoverage
+                ? "Render only the scenes from the stepped date"
+                : "View is off the searched coverage. SEARCH VIEW here first."}>
               LOAD THIS DATE
             </Toggle>
             <Toggle active={previewMode} onClick={onTogglePreview}
