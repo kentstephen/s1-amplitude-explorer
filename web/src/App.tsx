@@ -328,9 +328,9 @@ export default function App() {
           e.preventDefault();
           cmd.searchView?.();
           break;
-        case "enter": // load the most-complete mosaic for the current search
+        case "enter": // load the currently-stepped date's mosaic
           e.preventDefault();
-          cmd.loadMost?.();
+          cmd.loadDate?.();
           break;
         case "c": // toggle amplitude <-> composite
           cmd.toggleMode?.();
@@ -459,14 +459,35 @@ export default function App() {
     runSearch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
   };
 
-  // LOAD the coverage-first "most complete" mosaic across the whole window.
-  const handleLoadMostComplete = () => loadItems(search.selection.items);
   // LOAD only the date currently stepped to. Route through selectCoverageFirst so
   // a date with many overlapping frames still respects the scene cap.
   const handleLoadThisDate = () => {
     if (search.current)
       loadItems(selectCoverageFirst(search.current.items).items);
   };
+
+  // Step the date cursor AND load that date's mosaic, debounced so ripping
+  // through dates (held arrow key) doesn't kick off a fresh COG load per
+  // intermediate date, only the one you settle on. The target index is computed
+  // here (current dateIdx + delta) so we load the date we're stepping TO, not the
+  // stale current one. Off-coverage views can't load, so the auto-load is skipped
+  // there (the explicit LOAD THIS DATE button is disabled too).
+  const stepLoadTimer = useRef<number | null>(null);
+  const stepDate = useCallback(
+    (delta: number) => {
+      const { dates, dateIdx } = search;
+      if (dates.length === 0) return;
+      const next = Math.max(0, Math.min(dates.length - 1, dateIdx + delta));
+      search.setDateIdx(next);
+      if (stepLoadTimer.current) clearTimeout(stepLoadTimer.current);
+      if (!viewInCoverage) return;
+      const group = dates[next];
+      stepLoadTimer.current = window.setTimeout(() => {
+        loadItems(selectCoverageFirst(group.items).items);
+      }, 350);
+    },
+    [search, viewInCoverage, loadItems],
+  );
 
   // Fresh visit: kick off the default-AOI search once on mount. The result effect
   // below loads the target date when candidates arrive.
@@ -475,20 +496,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // When the auto-load search resolves, load the target date (or the most-complete
-  // mosaic if no overpass lands on it), then disarm so it never re-fires.
+  // When the auto-load search resolves, load the target date (or the best-coverage
+  // date if no overpass lands on it), then disarm so it never re-fires.
   useEffect(() => {
     if (!autoload.current || search.searching || !search.hasSearched) return;
     autoload.current = false;
     if (!search.dates.length) return; // empty result: leave the basemap up
-    const idx = search.dates.findIndex((d) => d.date === AUTOLOAD_DATE);
-    if (idx < 0) {
-      loadItems(search.selection.items);
-      return;
-    }
+    const found = search.dates.findIndex((d) => d.date === AUTOLOAD_DATE);
+    const idx = found < 0 ? 0 : found; // dates are best-coverage first
     search.setDateIdx(idx);
     loadItems(selectCoverageFirst(search.dates[idx].items).items);
-  }, [search.searching, search.hasSearched, search.dates, search.selection, search.setDateIdx, loadItems]);
+  }, [search.searching, search.hasSearched, search.dates, search.setDateIdx, loadItems]);
 
   const handleResetNorth = () => {
     mapRef.current?.getMap()?.easeTo({ bearing: 0, pitch: 0, duration: 400 });
@@ -629,12 +647,12 @@ export default function App() {
   // keydown listener via keyCmdRef). Reassigned every render so they're current.
   keyCmdRef.current = {
     searchView: handleSearchViewport,
-    loadMost: handleLoadMostComplete,
+    loadDate: handleLoadThisDate,
     toggleMode: () => setRenderMode((m) => (m === "amplitude" ? "composite" : "amplitude")),
     togglePalette: () => setCompositePalette((p) => (p === "cbSafe" ? "natural" : "cbSafe")),
     capture: captureExport,
-    stepPrev: () => search.step(-1),
-    stepNext: () => search.step(1),
+    stepPrev: () => stepDate(-1),
+    stepNext: () => stepDate(1),
     canStep: () => search.dates.length > 1,
   };
 
@@ -859,7 +877,7 @@ export default function App() {
         viewInCoverage={viewInCoverage}
         onTogglePreview={() => setPreviewMode((v) => !v)}
         onSearchViewport={handleSearchViewport}
-        onLoadMostComplete={handleLoadMostComplete}
+        onStepDate={stepDate}
         onLoadThisDate={handleLoadThisDate}
         pol={pol}
         onPolChange={setPol}
@@ -1308,7 +1326,7 @@ function InfoPanel({
   viewInCoverage,
   onTogglePreview,
   onSearchViewport,
-  onLoadMostComplete,
+  onStepDate,
   onLoadThisDate,
   pol,
   onPolChange,
@@ -1355,7 +1373,7 @@ function InfoPanel({
   viewInCoverage: boolean;
   onTogglePreview: () => void;
   onSearchViewport: () => void;
-  onLoadMostComplete: () => void;
+  onStepDate: (delta: number) => void;
   onLoadThisDate: () => void;
   pol: Polarization;
   onPolChange: (p: Polarization) => void;
@@ -1394,7 +1412,7 @@ function InfoPanel({
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
-  const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current, selection } = search;
+  const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
 
   const bandLabel = renderMode === "composite" ? "VV+VH" : pol.toUpperCase();
@@ -1570,18 +1588,18 @@ function InfoPanel({
         )}
       </Section>
 
-      {/* Coverage: step through candidate mosaics, load the most complete or one date */}
+      {/* Coverage: step through candidate dates; stepping auto-loads that date's mosaic */}
       {showCoverage && (
         <Section label="Coverage">
           <div style={{ fontFamily: UI.mono, fontSize: 11.5, color: UI.mute }}>
-            most complete: {selection.items.length} scene{selection.items.length === 1 ? "" : "s"}
-            {" · "}{selection.dates.length} date{selection.dates.length === 1 ? "" : "s"}
-            {" · "}{selection.footprintsCovered} frame{selection.footprintsCovered === 1 ? "" : "s"}
+            {candidates.length} scene{candidates.length === 1 ? "" : "s"}
+            {" · "}{dates.length} date{dates.length === 1 ? "" : "s"}
+            {" · "}step to load each
           </div>
 
-          {/* Date stepper: toggle through candidate dates, best coverage first */}
+          {/* Date stepper: stepping a date auto-loads its mosaic (debounced). */}
           <div style={{ marginTop: 9, display: "flex", alignItems: "center", gap: 6 }}>
-            <StepButton onClick={() => search.step(-1)} disabled={dateIdx <= 0} title="Previous date">
+            <StepButton onClick={() => onStepDate(-1)} disabled={dateIdx <= 0} title="Previous date (loads it)">
               ◀
             </StepButton>
             <div style={{ flex: 1, textAlign: "center" }}>
@@ -1593,20 +1611,12 @@ function InfoPanel({
                 {" · "}{current?.footprints ?? 0} frame{current?.footprints === 1 ? "" : "s"} this date
               </div>
             </div>
-            <StepButton onClick={() => search.step(1)} disabled={dateIdx >= dates.length - 1} title="Next date">
+            <StepButton onClick={() => onStepDate(1)} disabled={dateIdx >= dates.length - 1} title="Next date (loads it)">
               ▶
             </StepButton>
           </div>
 
-          <div style={{ marginTop: 10 }}>
-            <Toggle active onClick={onLoadMostComplete} grow disabled={!viewInCoverage}
-              title={viewInCoverage
-                ? "Render the coverage-first mosaic across the whole date window"
-                : "View is off the searched coverage. SEARCH VIEW here first."}>
-              LOAD MOST COMPLETE
-            </Toggle>
-          </div>
-          <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+          <div style={{ marginTop: 10, display: "flex", gap: 6 }}>
             <Toggle active={false} onClick={onLoadThisDate} grow disabled={!viewInCoverage}
               title={viewInCoverage
                 ? "Render only the scenes from the stepped date"
