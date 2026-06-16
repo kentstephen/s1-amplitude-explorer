@@ -5,7 +5,7 @@ import type { Device } from "@luma.gl/core";
 import "maplibre-gl/dist/maplibre-gl.css";
 import * as RadixSlider from "@radix-ui/react-slider";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
+import { Map as MaplibreMap, Marker, NavigationControl, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
 import { getRawFeatures, type PartialSTACItem, type Polarization } from "./stac";
@@ -537,10 +537,6 @@ export default function App() {
     loadItems(search.dates[idx].items);
   }, [search.searching, search.hasSearched, search.dates, search.setDateIdx, loadItems]);
 
-  const handleResetNorth = () => {
-    mapRef.current?.getMap()?.easeTo({ bearing: 0, pitch: 0, duration: 400 });
-  };
-
   // Geocode just MOVES the map (and drops a marker). It does NOT fetch — the
   // user hits FETCH VIEW when they're framed on what they want.
   const handlePickPlace = (r: GeoResult) => {
@@ -608,7 +604,12 @@ export default function App() {
     if (!loadActiveRef.current) return;
     const done = stats.loaded + stats.failed;
     const pending = renderItems.length - done;
-    if (renderItems.length > 0 && pending <= 0) {
+    // Settle at once when there's nothing left to wait on: everything in view drew
+    // (pending <= 0) OR nothing intersects the current view (renderItems empty). The
+    // empty case is the bug behind the bar spinning when you toggle/step into an area
+    // the loaded scenes don't cover: before, it fell through to the 3.5s-12s idle
+    // timeout with zero tiles in flight, so the bar spun for seconds over a basemap.
+    if (renderItems.length === 0 || pending <= 0) {
       loadActiveRef.current = false;
       setSettled(true);
       return;
@@ -895,6 +896,9 @@ export default function App() {
       >
         <DeckGLOverlay layers={allLayers} onDevice={setDevice} />
         <DrawBbox mapRef={mapRef} active={drawing} onComplete={handleDrawBox} />
+        {/* Native maplibre compass (top-right): bearing readout, click = north-up +
+            flat. Replaces the old custom NORTH↑ button. Kept stock, not restyled. */}
+        <NavigationControl position="top-right" showZoom={false} showCompass visualizePitch />
         {marker && showMarker && (
           <Marker longitude={marker.lng} latitude={marker.lat} anchor="bottom">
             <div
@@ -912,6 +916,15 @@ export default function App() {
           </Marker>
         )}
       </MaplibreMap>
+      {/* Labels + marker toggles, as maplibre-style icon buttons just below the
+          compass so they read as one on-map control cluster (top-right). */}
+      <MapControlCluster
+        labels={labels}
+        onToggleLabels={() => setLabels((v) => !v)}
+        showMarker={showMarker}
+        hasMarker={marker !== null}
+        onToggleMarker={() => setShowMarker((v) => !v)}
+      />
       <InfoPanel
         sceneCount={polItems.length}
         totalCount={stacItems.length}
@@ -940,16 +953,10 @@ export default function App() {
         onDateFromChange={setDateFrom}
         dateTo={dateTo}
         onDateToChange={setDateTo}
-        labels={labels}
-        onLabelsChange={setLabels}
         onPickPlace={handlePickPlace}
         searchRef={searchRef}
-        hasMarker={marker !== null}
-        showMarker={showMarker}
-        onToggleMarker={() => setShowMarker((v) => !v)}
         drawing={drawing}
         onToggleDraw={() => setDrawing((v) => !v)}
-        onResetNorth={handleResetNorth}
         onSaveSettings={handleSaveSettings}
         onResetSettings={handleResetSettings}
         savedFlash={savedFlash}
@@ -1107,6 +1114,127 @@ function Toggle({
     >
       {children}
     </button>
+  );
+}
+
+/**
+ * On-map control cluster (top-right, tucked under the maplibre compass). Buttons
+ * are styled to MATCH maplibre's native NavigationControl (white group, dark glyph,
+ * 29px squares) so the compass + these read as one stack. Each toggle is an ICON
+ * with a diagonal slash when OFF; clicking clears the slash and the feature shows.
+ */
+function MapControlCluster({
+  labels,
+  onToggleLabels,
+  showMarker,
+  hasMarker,
+  onToggleMarker,
+}: {
+  labels: boolean;
+  onToggleLabels: () => void;
+  showMarker: boolean;
+  hasMarker: boolean;
+  onToggleMarker: () => void;
+}) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 48,
+        right: 10,
+        background: "#fff",
+        borderRadius: 4,
+        boxShadow: "0 0 0 2px rgba(0,0,0,0.1)",
+        overflow: "hidden",
+        zIndex: 1,
+      }}
+    >
+      <MapIconButton
+        on={labels}
+        onClick={onToggleLabels}
+        title={labels ? "Hide place labels" : "Show place labels"}
+        ariaLabel="Toggle place labels"
+        icon={<LabelGlyph />}
+      />
+      {hasMarker && (
+        <MapIconButton
+          on={showMarker}
+          onClick={onToggleMarker}
+          title={showMarker ? "Hide marker" : "Show marker"}
+          ariaLabel="Toggle marker"
+          icon={<MarkerGlyph />}
+          divider
+        />
+      )}
+    </div>
+  );
+}
+
+function MapIconButton({
+  on,
+  onClick,
+  title,
+  ariaLabel,
+  icon,
+  divider,
+}: {
+  on: boolean;
+  onClick: () => void;
+  title: string;
+  ariaLabel: string;
+  icon: React.ReactNode;
+  divider?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={ariaLabel}
+      aria-pressed={on}
+      style={{
+        display: "block",
+        width: 29,
+        height: 29,
+        padding: 0,
+        border: "none",
+        borderTop: divider ? "1px solid #ddd" : "none",
+        background: "transparent",
+        cursor: "pointer",
+        color: "#333",
+      }}
+    >
+      <svg width="22" height="22" viewBox="0 0 24 24" style={{ display: "block", margin: "0 auto" }}>
+        {icon}
+        {/* OFF -> a slash through the glyph (white halo so it reads over the icon). */}
+        {!on && (
+          <>
+            <line x1="3" y1="3" x2="21" y2="21" stroke="#fff" strokeWidth="3.5" strokeLinecap="round" />
+            <line x1="3" y1="3" x2="21" y2="21" stroke="#333" strokeWidth="1.8" strokeLinecap="round" />
+          </>
+        )}
+      </svg>
+    </button>
+  );
+}
+
+// Material-ish "label" tag glyph (place-labels toggle).
+function LabelGlyph() {
+  return (
+    <path
+      fill="currentColor"
+      d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16z"
+    />
+  );
+}
+
+// Map-pin glyph (marker show/hide toggle).
+function MarkerGlyph() {
+  return (
+    <path
+      fill="currentColor"
+      d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 0 1 0-5 2.5 2.5 0 0 1 0 5z"
+    />
   );
 }
 
@@ -1390,16 +1518,10 @@ function InfoPanel({
   onDateFromChange,
   dateTo,
   onDateToChange,
-  labels,
-  onLabelsChange,
   onPickPlace,
   searchRef,
-  hasMarker,
-  showMarker,
-  onToggleMarker,
   drawing,
   onToggleDraw,
-  onResetNorth,
   onSaveSettings,
   onResetSettings,
   savedFlash,
@@ -1438,16 +1560,10 @@ function InfoPanel({
   onDateFromChange: (v: string) => void;
   dateTo: string;
   onDateToChange: (v: string) => void;
-  labels: boolean;
-  onLabelsChange: (v: boolean) => void;
   onPickPlace: (r: GeoResult) => void;
   searchRef: React.Ref<HTMLInputElement>;
-  hasMarker: boolean;
-  showMarker: boolean;
-  onToggleMarker: () => void;
   drawing: boolean;
   onToggleDraw: () => void;
-  onResetNorth: () => void;
   onSaveSettings: () => void;
   onResetSettings: () => void;
   savedFlash: "" | "saved" | "reset";
@@ -1837,22 +1953,10 @@ function InfoPanel({
       </Group>
 
       <Group label="Export">
-      {/* Map: labels, north reset, marker, live zoom readout */}
+      {/* Live zoom / device-pixel-ratio readout (diagnostic). The map-view toggles
+          (labels, marker) + north compass now live on the map, top-right. */}
       <Section label="Map" first>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
-            LABELS {labels ? "ON" : "OFF"}
-          </Toggle>
-          <Toggle active={false} onClick={onResetNorth} title="Reset to north-up, flat">
-            NORTH ↑
-          </Toggle>
-          {hasMarker && (
-            <Toggle active={showMarker} onClick={onToggleMarker}>
-              {showMarker ? "HIDE MARKER" : "SHOW MARKER"}
-            </Toggle>
-          )}
-        </div>
-        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 8 }}>
+        <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint }}>
           zoom {zoom.toFixed(2)} · dpr {window.devicePixelRatio}
         </div>
       </Section>
