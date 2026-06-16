@@ -11,11 +11,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 
 import { fetchStacItems, type PartialSTACItem } from "./stac";
-import {
-  groupByDate,
-  selectCoverageFirst,
-  type CoverageSelection,
-} from "./coverage";
+import { groupByDate } from "./coverage";
 
 // Page cap for a candidate search. Far above the old most-recent-3 load cap:
 // we want the WHOLE date window's scenes to rank coverage, not just the latest.
@@ -35,14 +31,12 @@ export type SceneSearch = {
   error: string | null;
   /** True once a search has run (distinguishes idle from an empty result). */
   hasSearched: boolean;
-  /** Dates over the window, best-coverage first, for the stepper. */
+  /** Dates over the window, chronological (earliest first), for the stepper. */
   dates: DateGroup[];
   /** Current step index into `dates`. */
   dateIdx: number;
   /** The currently-stepped date group, or null. */
   current: DateGroup | null;
-  /** Coverage-first "most complete" mosaic across the whole window. */
-  selection: CoverageSelection;
   /** Run a candidate search over an AOI + datetime interval. Does NOT load tiles. */
   search: (bbox: [number, number, number, number], datetime: string) => void;
   setDateIdx: (i: number) => void;
@@ -55,10 +49,6 @@ export type SceneSearch = {
 export type OrbitFilter = "ascending" | "descending" | null;
 
 export type SceneSearchOptions = {
-  /** Optional hard cap on scenes in the "most complete" selection. Undefined
-   *  keeps `selectCoverageFirst`'s interactive default (3); export mode passes a
-   *  far higher cap so a wide AOI can mosaic many frames. */
-  maxScenes?: number;
   /** Lock the candidate set to one orbit direction. Ascending and descending
    *  light opposite slope faces, so mixing them in a wide mosaic gives the worst
    *  tonal seams; locking one direction is the cheapest seam reduction. */
@@ -66,7 +56,7 @@ export type SceneSearchOptions = {
 };
 
 export function useSceneSearch(opts: SceneSearchOptions = {}): SceneSearch {
-  const { maxScenes, orbit = null } = opts;
+  const { orbit = null } = opts;
   const abort = useRef<AbortController | null>(null);
   const [rawCandidates, setRawCandidates] = useState<PartialSTACItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -103,18 +93,14 @@ export function useSceneSearch(opts: SceneSearchOptions = {}): SceneSearch {
     [],
   );
 
-  // Apply the orbit-direction lock before any grouping, so the date stepper, the
-  // coverage selection, and the footprint overlay all reflect a single look.
+  // Apply the orbit-direction lock before any grouping, so the date stepper and
+  // the footprint overlay reflect a single look.
   const candidates = useMemo(
     () => (orbit ? rawCandidates.filter((c) => c.orbit === orbit) : rawCandidates),
     [rawCandidates, orbit],
   );
 
   const dates = useMemo(() => groupByDate(candidates), [candidates]);
-  const selection = useMemo(
-    () => selectCoverageFirst(candidates, { maxScenes }),
-    [candidates, maxScenes],
-  );
   const current = dates[dateIdx] ?? null;
 
   const step = useCallback(
@@ -133,7 +119,7 @@ export function useSceneSearch(opts: SceneSearchOptions = {}): SceneSearch {
 
   return {
     candidates, searching, error, hasSearched,
-    dates, dateIdx, current, selection,
+    dates, dateIdx, current,
     search, setDateIdx, step, reset,
   };
 }

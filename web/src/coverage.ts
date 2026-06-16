@@ -121,10 +121,9 @@ export function selectCoverageFirst(
 }
 
 /**
- * Group candidates by acquisition date for the SEARCH VIEW date stepper, with
- * the BEST-COVERAGE dates up front: ordered by distinct footprint groups that
- * date's scenes cover (desc), then recency. Stepping starts at the date that
- * fills the most of the AOI on its own.
+ * Group candidates by acquisition date for the SEARCH VIEW date stepper, in
+ * CHRONOLOGICAL order (earliest first). Stepping starts at the first date in the
+ * range and the arrows browse forward/back in time.
  */
 export function groupByDate(
   candidates: PartialSTACItem[],
@@ -142,5 +141,5 @@ export function groupByDate(
       items,
       footprints: new Set(items.map(groupKey)).size,
     }))
-    .sort((a, b) => b.footprints - a.footprints || (a.date < b.date ? 1 : -1));
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }

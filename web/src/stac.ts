@@ -122,6 +122,18 @@ function orbitOf(f: StacFeature): PartialSTACItem["orbit"] {
   return o === "ascending" || o === "descending" ? o : null;
 }
 
+// Side cache of the verbatim Earth Search features, keyed by item id, kept OUT of
+// the PartialSTACItem objects that flow into the deck.gl layers (hanging the full
+// feature on every rendered item bogs down layer diffing). Used only by the STAC
+// download to emit a faithful ItemCollection. Last search wins; bounded by the
+// candidate limit, so it can't grow without end.
+const rawById = new Map<string, StacFeature>();
+
+/** Full STAC features for the given item ids (skips any not in the cache). */
+export function getRawFeatures(ids: string[]): StacFeature[] {
+  return ids.map((id) => rawById.get(id)).filter((f): f is StacFeature => !!f);
+}
+
 /**
  * Page through Earth Search for IW-mode GRD scenes over the AOI, rewriting each
  * VV/VH measurement href to the https bucket endpoint. Scenes with neither pol
@@ -132,6 +144,7 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
 
   const items: PartialSTACItem[] = [];
   let rejected = 0;
+  rawById.clear(); // fresh search: drop the previous candidates' raw features
 
   const body: Record<string, unknown> = {
     collections: [COLLECTION],
@@ -176,6 +189,7 @@ export async function fetchStacItems(opts: FetchOptions): Promise<FetchResult> {
           ...(vh ? { vh: { href: vh } } : {}),
         },
       });
+      rawById.set(feat.id, feat);
       if (items.length >= maxItems) break;
     }
 

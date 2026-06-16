@@ -8,9 +8,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Map as MaplibreMap, Marker, useControl } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
-import { type PartialSTACItem, type Polarization } from "./stac";
+import { getRawFeatures, type PartialSTACItem, type Polarization } from "./stac";
 import { useSceneSearch, type SceneSearch, type OrbitFilter } from "./useSceneSearch";
-import { selectCoverageFirst } from "./coverage";
 import { footprintCollection } from "./footprints";
 import {
   reportFailed,
@@ -80,13 +79,13 @@ function bboxIntersects(
 }
 
 /**
- * Build a self-describing export filename from the loaded mosaic so a folder of
- * captures is legible at a glance: pol, look direction, the acquisition-date span
- * actually rendered, scene count, and the map center + zoom. The browser dedupes
- * collisions with a trailing "(1)", so no timestamp is needed.
- *   s1-amp_VV_desc_2020-11-23..2020-12-05_30sc_27.95N_85.42E_z7.4.png
+ * Self-describing slug for the loaded mosaic so a folder of exports is legible at
+ * a glance: pol/band, look direction, the acquisition-date span actually rendered,
+ * scene count, and the map center + zoom. Shared by the PNG capture and the STAC
+ * download so both name files the same way.
+ *   VV_desc_2020-11-23..2020-12-05_30sc_27.95N_85.42E_z7.4
  */
-function exportFilename(
+function viewSlug(
   map: { getCenter: () => { lat: number; lng: number }; getZoom: () => number },
   items: PartialSTACItem[],
   pol: Polarization,
@@ -108,8 +107,25 @@ function exportFilename(
   const lon = `${Math.abs(c.lng).toFixed(2)}${c.lng >= 0 ? "E" : "W"}`;
   const z = `z${map.getZoom().toFixed(1)}`;
   const band = renderMode === "composite" ? "RGB" : pol.toUpperCase();
-  return `s1-amp_${band}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}.png`;
+  return `${band}_${look}_${span}_${items.length}sc_${lat}_${lon}_${z}`;
 }
+
+// The browser dedupes filename collisions with a trailing "(1)", so no timestamp.
+const exportFilename = (
+  map: { getCenter: () => { lat: number; lng: number }; getZoom: () => number },
+  items: PartialSTACItem[],
+  pol: Polarization,
+  orbit: OrbitFilter,
+  renderMode: RenderMode,
+) => `s1-amp_${viewSlug(map, items, pol, orbit, renderMode)}.png`;
+
+const stacFilename = (
+  map: { getCenter: () => { lat: number; lng: number }; getZoom: () => number },
+  items: PartialSTACItem[],
+  pol: Polarization,
+  orbit: OrbitFilter,
+  renderMode: RenderMode,
+) => `s1-stac_${viewSlug(map, items, pol, orbit, renderMode)}.json`;
 
 /**
  * Reprojection-mesh error budget (pixels) as a function of viewport zoom.
@@ -419,14 +435,20 @@ export default function App() {
     console.info(`[load] ${items.length} S1 GRD scenes into the mosaic`);
   }, []);
 
-  // SEARCH the current date window over an AOI. Shows the coverage overlay; does
-  // NOT load tiles (the user picks a mosaic to LOAD).
+  // Armed by runSearch, consumed by the result effect below: once a search
+  // resolves, auto-load the first date in the range so a search lands you straight
+  // on imagery (no separate LOAD step). Fresh-visit additionally targets AUTOLOAD_DATE.
+  const pendingSearchLoad = useRef(false);
+
+  // SEARCH the current date window over an AOI. Shows the coverage overlay, then
+  // auto-loads the first date in the range when results arrive (see the effect below).
   const runSearch = useCallback(
     (targetBbox: [number, number, number, number]) => {
       setBbox(targetBbox);
       setMarker(null);
       setPreviewMode(true);
       setMovedSinceSearch(false);
+      pendingSearchLoad.current = true;
       search.search(targetBbox, datetimeOf(dateFrom, dateTo));
     },
     [search, dateFrom, dateTo],
@@ -459,19 +481,17 @@ export default function App() {
     runSearch([cx - halfW, cy - halfH, cx + halfW, cy + halfH]);
   };
 
-  // LOAD only the date currently stepped to. Route through selectCoverageFirst so
-  // a date with many overlapping frames still respects the scene cap.
+  // LOAD all scenes for the date currently stepped to. The viewport AOI cap +
+  // in-view cull keep the scene count bounded, so no coverage selection is needed.
   const handleLoadThisDate = () => {
-    if (search.current)
-      loadItems(selectCoverageFirst(search.current.items).items);
+    if (search.current) loadItems(search.current.items);
   };
 
   // Step the date cursor AND load that date's mosaic, debounced so ripping
   // through dates (held arrow key) doesn't kick off a fresh COG load per
   // intermediate date, only the one you settle on. The target index is computed
   // here (current dateIdx + delta) so we load the date we're stepping TO, not the
-  // stale current one. Off-coverage views can't load, so the auto-load is skipped
-  // there (the explicit LOAD THIS DATE button is disabled too).
+  // stale current one. Off-coverage views can't load, so the load is skipped there.
   const stepLoadTimer = useRef<number | null>(null);
   const stepDate = useCallback(
     (delta: number) => {
@@ -483,7 +503,7 @@ export default function App() {
       if (!viewInCoverage) return;
       const group = dates[next];
       stepLoadTimer.current = window.setTimeout(() => {
-        loadItems(selectCoverageFirst(group.items).items);
+        loadItems(group.items);
       }, 350);
     },
     [search, viewInCoverage, loadItems],
@@ -496,16 +516,22 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // When the auto-load search resolves, load the target date (or the best-coverage
-  // date if no overpass lands on it), then disarm so it never re-fires.
+  // When a search resolves, auto-load the FIRST date in the range (dates are
+  // chronological, so dates[0] = earliest). On a fresh visit only, prefer
+  // AUTOLOAD_DATE if that exact overpass exists. Disarms after one load.
   useEffect(() => {
-    if (!autoload.current || search.searching || !search.hasSearched) return;
+    if (!pendingSearchLoad.current || search.searching || !search.hasSearched) return;
+    pendingSearchLoad.current = false;
+    const wasAutoload = autoload.current;
     autoload.current = false;
-    if (!search.dates.length) return; // empty result: leave the basemap up
-    const found = search.dates.findIndex((d) => d.date === AUTOLOAD_DATE);
-    const idx = found < 0 ? 0 : found; // dates are best-coverage first
+    if (!search.dates.length) return; // empty result: leave the basemap + empty coverage
+    let idx = 0;
+    if (wasAutoload) {
+      const found = search.dates.findIndex((d) => d.date === AUTOLOAD_DATE);
+      if (found >= 0) idx = found;
+    }
     search.setDateIdx(idx);
-    loadItems(selectCoverageFirst(search.dates[idx].items).items);
+    loadItems(search.dates[idx].items);
   }, [search.searching, search.hasSearched, search.dates, search.setDateIdx, loadItems]);
 
   const handleResetNorth = () => {
@@ -643,6 +669,28 @@ export default function App() {
     }
   }, [pol, renderItems, orbitFilter, renderMode]);
 
+  /**
+   * Download the scenes loaded in the current view as a STAC ItemCollection
+   * (.json): full Earth Search features (from the side cache, latest search only),
+   * so the file is a faithful, reloadable STAC response (pystac / geopandas / odc-
+   * stac / QGIS). Scoped to renderItems (what's on the map), named like the PNG.
+   */
+  const downloadStac = useCallback(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || renderItems.length === 0) return;
+    const features = getRawFeatures(renderItems.map((it) => it.id));
+    const fc = { type: "FeatureCollection", features };
+    // Data URL (same path as the PNG capture), so there's no blob-URL revoke race
+    // to abort the download. A few dozen items is well within data-URI limits.
+    const a = document.createElement("a");
+    a.href =
+      "data:application/json;charset=utf-8," +
+      encodeURIComponent(JSON.stringify(fc, null, 2));
+    a.download = stacFilename(map, renderItems, pol, orbitFilter, renderMode);
+    a.click();
+    console.info(`[stac] downloaded ${features.length} items`);
+  }, [renderItems, pol, orbitFilter, renderMode]);
+
   // Wire the keyboard commands to the current handlers (read by the mounted
   // keydown listener via keyCmdRef). Reassigned every render so they're current.
   keyCmdRef.current = {
@@ -770,37 +818,32 @@ export default function App() {
   }, [renderItems, labelBeforeId, renderMode, pol, gen, fetchGen, dbRange, gamma, meshMaxError, compositePalette]);
 
   // SEARCH VIEW coverage overlay: candidate footprints, the stepped date bright,
-  // the "most complete" selection dim-teal, the rest faint. Sits above the
-  // raster, below labels. Only while previewing (cleared once a mosaic loads).
+  // the rest faint. Sits above the raster, below labels. Only while previewing
+  // (cleared once a mosaic loads).
   const footprintLayer = useMemo(() => {
     if (!previewMode || capturing || search.candidates.length === 0) return null;
     const activeIds = new Set((search.current?.items ?? []).map((i) => i.id));
-    const selectedIds = new Set(search.selection.items.map((i) => i.id));
-    const data = footprintCollection(search.candidates, activeIds, selectedIds);
+    const data = footprintCollection(search.candidates, activeIds, new Set());
     return new GeoJsonLayer({
       id: "coverage-footprints",
       data: data as any,
       stroked: true,
       filled: true,
       getFillColor: (f: any) =>
-        f.properties.active ? [125, 211, 192, 38]
-          : f.properties.selected ? [125, 211, 192, 12]
-          : [255, 255, 255, 6],
+        f.properties.active ? [125, 211, 192, 38] : [255, 255, 255, 6],
       getLineColor: (f: any) =>
-        f.properties.active ? [125, 211, 192, 255]
-          : f.properties.selected ? [125, 211, 192, 130]
-          : [255, 255, 255, 64],
+        f.properties.active ? [125, 211, 192, 255] : [255, 255, 255, 64],
       getLineWidth: (f: any) => (f.properties.active ? 2 : 1),
       lineWidthUnits: "pixels",
       pickable: false,
       updateTriggers: {
-        getFillColor: [search.dateIdx, search.selection],
-        getLineColor: [search.dateIdx, search.selection],
+        getFillColor: [search.dateIdx],
+        getLineColor: [search.dateIdx],
         getLineWidth: [search.dateIdx],
       },
       beforeId: labelBeforeId,
     } as any);
-  }, [previewMode, capturing, search.candidates, search.current, search.selection, search.dateIdx, labelBeforeId]);
+  }, [previewMode, capturing, search.candidates, search.current, search.dateIdx, labelBeforeId]);
 
   const allLayers = useMemo(
     () => (footprintLayer ? [...layers, footprintLayer] : layers),
@@ -909,6 +952,7 @@ export default function App() {
         savedFlash={savedFlash}
         zoom={zoom}
         onCapture={captureExport}
+        onDownloadStac={downloadStac}
         capturing={capturing}
         orbitFilter={orbitFilter}
         onOrbitFilterChange={setOrbitFilter}
@@ -1358,6 +1402,7 @@ function InfoPanel({
   savedFlash,
   zoom,
   onCapture,
+  onDownloadStac,
   capturing,
   orbitFilter,
   onOrbitFilterChange,
@@ -1405,12 +1450,14 @@ function InfoPanel({
   savedFlash: "" | "saved" | "reset";
   zoom: number;
   onCapture: () => void;
+  onDownloadStac: () => void;
   capturing: boolean;
   orbitFilter: OrbitFilter;
   onOrbitFilterChange: (o: OrbitFilter) => void;
   settled: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [stacFlash, setStacFlash] = useState(false);
   const pending = Math.max(0, sceneCount - stats.loaded - stats.failed);
   const { searching, error: searchError, hasSearched, candidates, dates, dateIdx, current } = search;
   const showCoverage = hasSearched && !searching && !searchError && candidates.length > 0;
@@ -1440,6 +1487,12 @@ function InfoPanel({
   const copyFailures = () => {
     const text = stats.failures.map((f) => `${f.url}\n  ${f.err}`).join("\n\n");
     navigator.clipboard?.writeText(text).catch(() => {});
+  };
+
+  const downloadStac = () => {
+    onDownloadStac();
+    setStacFlash(true);
+    setTimeout(() => setStacFlash(false), 1400);
   };
   if (collapsed) {
     return (
@@ -1617,13 +1670,7 @@ function InfoPanel({
           </div>
 
           <div style={{ marginTop: 10, display: "flex", gap: 6 }}>
-            <Toggle active={false} onClick={onLoadThisDate} grow disabled={!viewInCoverage}
-              title={viewInCoverage
-                ? "Render only the scenes from the stepped date"
-                : "View is off the searched coverage. SEARCH VIEW here first."}>
-              LOAD THIS DATE
-            </Toggle>
-            <Toggle active={previewMode} onClick={onTogglePreview}
+            <Toggle active={previewMode} onClick={onTogglePreview} grow
               title="Show / hide the footprint coverage overlay on the map">
               COVERAGE {previewMode ? "ON" : "OFF"}
             </Toggle>
@@ -1632,7 +1679,7 @@ function InfoPanel({
       )}
       </Group>
 
-      <Group label="Look">
+      <Group label="Style">
       {/* Render: mode + (pol) + dB stretch + gamma. Amplitude = single-pol
           grayscale; Composite = dual-pol VV/VH/ratio false colour. */}
       <Section label={renderMode === "composite" ? "Composite" : "Amplitude"} first>
@@ -1786,9 +1833,9 @@ function InfoPanel({
       </Section>
       </Group>
 
-      <Group label="View">
-      {/* View: labels, north reset, marker, live zoom readout */}
-      <Section label="View" first>
+      <Group label="Export">
+      {/* Map: labels, north reset, marker, live zoom readout */}
+      <Section label="Map" first>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
           <Toggle active={labels} onClick={() => onLabelsChange(!labels)}>
             LABELS {labels ? "ON" : "OFF"}
@@ -1807,17 +1854,21 @@ function InfoPanel({
         </div>
       </Section>
 
-      {/* Export: grab a PNG of the current map */}
-      <Section label="Export">
-        <div>
+      {/* Download: grab a PNG, or download the STAC items for the current view */}
+      <Section label="Download">
+        <div style={{ display: "flex", gap: 6 }}>
           <Toggle active={capturing} onClick={onCapture} grow
             title="Wait for all scenes to finish loading, then download a PNG of the map (no UI chrome).">
             {capturing ? "CAPTURING…" : "CAPTURE PNG"}
           </Toggle>
+          <Toggle active={stacFlash} onClick={downloadStac} grow disabled={sceneCount === 0}
+            title="Download the STAC ItemCollection (.json) for the scenes loaded in this view (latest search): full Earth Search metadata, asset hrefs, footprints. Loads in pystac, geopandas, QGIS, odc-stac.">
+            {stacFlash ? "DOWNLOADED ✓" : "DOWNLOAD STAC"}
+          </Toggle>
         </div>
         {sceneCount === 0 && (
           <div style={{ fontFamily: UI.mono, fontSize: 11, color: UI.faint, marginTop: 6 }}>
-            Load a mosaic first; capture grabs what's on the map.
+            Load a mosaic first; export grabs what's on the map.
           </div>
         )}
       </Section>
