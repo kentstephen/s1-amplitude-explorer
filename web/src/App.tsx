@@ -344,7 +344,7 @@ export default function App() {
           e.preventDefault();
           cmd.searchView?.();
           break;
-        case "enter": // load the currently-stepped date's mosaic
+        case "enter": // reload the currently-stepped date's mosaic (forces a re-fetch)
           e.preventDefault();
           cmd.loadDate?.();
           break;
@@ -497,7 +497,10 @@ export default function App() {
     (delta: number) => {
       const { dates, dateIdx } = search;
       if (dates.length === 0) return;
-      const next = Math.max(0, Math.min(dates.length - 1, dateIdx + delta));
+      // Wrap around both ends so stepping loops the range (last → first, first →
+      // last) instead of dead-ending. Double-mod keeps a negative delta positive.
+      const n = dates.length;
+      const next = (((dateIdx + delta) % n) + n) % n;
       search.setDateIdx(next);
       if (stepLoadTimer.current) clearTimeout(stepLoadTimer.current);
       if (!viewInCoverage) return;
@@ -1652,7 +1655,7 @@ function InfoPanel({
 
           {/* Date stepper: stepping a date auto-loads its mosaic (debounced). */}
           <div style={{ marginTop: 9, display: "flex", alignItems: "center", gap: 6 }}>
-            <StepButton onClick={() => onStepDate(-1)} disabled={dateIdx <= 0} title="Previous date (loads it)">
+            <StepButton onClick={() => onStepDate(-1)} disabled={dates.length <= 1} title="Previous date (loads it; wraps to last)">
               ◀
             </StepButton>
             <div style={{ flex: 1, textAlign: "center" }}>
@@ -1664,7 +1667,7 @@ function InfoPanel({
                 {" · "}{current?.footprints ?? 0} frame{current?.footprints === 1 ? "" : "s"} this date
               </div>
             </div>
-            <StepButton onClick={() => onStepDate(1)} disabled={dateIdx >= dates.length - 1} title="Next date (loads it)">
+            <StepButton onClick={() => onStepDate(1)} disabled={dates.length <= 1} title="Next date (loads it; wraps to first)">
               ▶
             </StepButton>
           </div>
@@ -1963,7 +1966,7 @@ function InfoPanel({
           <span style={{ display: "flex", flexWrap: "wrap", columnGap: 10, rowGap: 3 }}>
             <span><span style={{ color: UI.mute }}>/</span> search</span>
             <span><span style={{ color: UI.mute }}>S</span> this view</span>
-            <span><span style={{ color: UI.mute }}>⏎</span> load</span>
+            <span><span style={{ color: UI.mute }}>⏎</span> reload</span>
             <span><span style={{ color: UI.mute }}>C</span> composite</span>
             <span><span style={{ color: UI.mute }}>B</span> palette</span>
             <span><span style={{ color: UI.mute }}>G</span> grab PNG</span>
