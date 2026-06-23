@@ -136,6 +136,20 @@ Three realistic sources, in rough order of fork-friendliness:
 - **Product = IW GRD, polarization = VV default (VH toggle), display = dB stretch
   → grayscale/colormap, no elevation.**
 
+## Evaluated and set aside
+
+### sarsen (bopen/sarsen)
+
+Python library for SAR terrain correction (geometric geocoding + radiometric
+gamma flattening / RTC). Uses a DEM input via rioxarray/rasterio to warp and
+normalize backscatter. v0.9.6 (2026-06-23) is a performance update -- faster
+Dask `map_overlap`, chunk interpolation for GRD, remote-source support.
+
+Not relevant here for two reasons: (1) it produces RTC, which deliberately
+removes the terrain-induced brightness variation that makes this project's
+imagery dramatic -- the opposite of what we want; (2) it is Python + Dask,
+server-side only, incompatible with the browser GPU shader pipeline.
+
 ## Sources
 
 - [Sentinel-1 SLC vs GRD (Copernicus docs)](https://documentation.dataspace.copernicus.eu/Data/SentinelMissions/Sentinel1.html)
